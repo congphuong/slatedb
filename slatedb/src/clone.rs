@@ -179,6 +179,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     segment_projection.as_ref(),
                 )
                 .await?;
+                validate_wal_names(&sources, wal_admin)?;
                 let copy_wal_params = match &sources[..] {
                     [source] => Some(copy_wal_params_for_source(
                         source,
@@ -215,6 +216,9 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     }
                 };
                 manifest.core.initialized = false;
+                // The clone uses the WAL implementation of `wal_admin`, which is also the
+                // implementation of every source (see `validate_wal_names`).
+                manifest.core.wal_name = wal_admin.wal_name().map(str::to_string);
 
                 (
                     StoredManifest::store_uninitialized_clone(
@@ -500,6 +504,23 @@ fn validate_clone_source_specs<R: RangeBounds<Bytes> + Clone>(
         if !seen_paths.insert(source.path.to_string()) {
             return Err(SlateDBError::DuplicatedCloneSourcePath(source.path.clone()));
         }
+    }
+    Ok(())
+}
+
+/// Makes sure that every source records the WAL implementation of `wal_admin`.
+///
+/// The clone reads the WAL of its sources through `wal_admin`. An implementation cannot see
+/// the rows of a different implementation, so it also cannot prove that such a WAL is empty.
+/// To clone across WAL implementations, first change the implementation of the source with
+/// [`crate::admin::Admin::set_wal_name`].
+fn validate_wal_names(
+    sources: &[CloneSource],
+    wal_admin: &dyn WalAdmin,
+) -> Result<(), SlateDBError> {
+    let configured = wal_admin.wal_name();
+    for source in sources {
+        source.manifest.core.validate_wal_name(configured)?;
     }
     Ok(())
 }

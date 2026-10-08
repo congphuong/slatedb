@@ -161,6 +161,16 @@ pub trait WriterInit: Send + Sync + 'static {
         &self,
         manifest: &mut WriterManifest,
     ) -> Result<WriterInitResult, WalError>;
+
+    /// Returns the name of this WAL implementation, or `None` for the native SlateDB WAL.
+    ///
+    /// SlateDB stores the name in the manifest when it creates a database. After that, SlateDB
+    /// refuses to open the database with an implementation that has a different name. Rows that
+    /// are in one WAL implementation are not visible to another one, so a wrong implementation
+    /// would drop them without an error.
+    fn wal_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Describes the current status of the WAL
@@ -310,12 +320,33 @@ pub trait WalReader: Send + Sync + 'static {
     /// `replay_after_wal_id` if no later WAL file is present. Implementations may use
     /// `replay_after_wal_id` as a known lower bound when locating the end of the WAL.
     async fn last_wal_file_id(&self, replay_after_wal_id: u64) -> Result<u64, WalError>;
+
+    /// Returns the name of this WAL implementation, or `None` for the native SlateDB WAL.
+    ///
+    /// A reader refuses to open a database whose manifest records a different name. See
+    /// [`WriterInit::wal_name`].
+    fn wal_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Trait that defines the contract between SlateDB's garbage collector and a custom WAL
 /// implementation. SlateDB tracks the set of currently referenced WAL ranges in its manifest.
 /// When the Garbage Collector runs, it computes this set and calls [`WalGc::collect`] so that
 /// the implementation can clean up any un-referenced WAL storage.
+///
+/// ## WAL storage that several databases share
+///
+/// One WAL implementation can store the WAL rows of several databases in the same storage
+/// object. For example, a process that runs many databases can write the rows of all of them
+/// in one object for each flush. SlateDB calls [`WalGc::collect`] for each database, with the
+/// ranges that this database references. The ranges of one database say nothing about the
+/// other databases. Thus an implementation that shares storage between databases must delete
+/// a shared object only when no database that has rows in that object references them.
+///
+/// A database that is not open in the process that collects garbage has no garbage collector
+/// task that calls [`WalGc::collect`]. Use [`crate::admin::Admin::referenced_wal_ranges`] to
+/// get the ranges that such a database references.
 #[async_trait]
 pub trait WalGc: Send + Sync + 'static {
     /// Hook for garbage collecting the WAL. Takes a list of ranges of WAL Files that are currently
@@ -340,6 +371,14 @@ pub trait WalAdmin: Send + Sync + 'static {
     /// ## Returns
     /// A garbage collector that can remove unreferenced WAL files at `path`.
     fn garbage_collector(&self, path: &Path) -> Arc<dyn WalGc>;
+
+    /// Returns the name of this WAL implementation, or `None` for the native SlateDB WAL.
+    ///
+    /// A clone records this name in its manifest. If a clone source records a different name,
+    /// the WAL of that source must be empty. See [`WriterInit::wal_name`].
+    fn wal_name(&self) -> Option<&str> {
+        None
+    }
 
     /// Deletes the WAL at `path`.
     ///
