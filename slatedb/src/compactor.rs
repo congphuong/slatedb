@@ -71,6 +71,7 @@ use ulid::Ulid;
 
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
+use crate::compaction_signals::CompactionSignals;
 use crate::compaction_worker::CompactionWorkerHandler;
 use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::CompactionStats;
@@ -78,7 +79,7 @@ use crate::compactor_state_protocols::CompactorStateWriter;
 use crate::config::CompactorOptions;
 use crate::db_state::{SortedRun, SsTableView};
 use crate::db_status::ClosedResultWriter;
-use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef, Notifier};
 use crate::error::{Error, SlateDBError};
 use crate::manifest::store::ManifestStore;
 use crate::manifest::{LsmTreeState, ManifestCore};
@@ -276,6 +277,13 @@ pub(crate) enum CompactorMessage {
     /// Fast ticker to commit any `Compacted` entries written by workers without
     /// waiting for the full `poll_interval` cycle.
     CommitCompacted,
+    /// The writer in this process added L0 SSTs to the manifest. The handler
+    /// refreshes the manifest and schedules compactions, like `PollManifest`.
+    /// See [`crate::compaction_signals`].
+    L0Flushed,
+    /// The worker in this process wrote a `Compacted` result. The handler
+    /// commits it, like `CommitCompacted`. See [`crate::compaction_signals`].
+    CompactionFinished,
 }
 
 /// The compactor is responsible for taking groups of sorted runs (this doc uses the term
@@ -383,7 +391,7 @@ impl Compactor {
         // either spawned in this process (set `worker: Some`) or running standalone (set `worker: None`).
         let (_tx, rx) = async_channel::unbounded::<CompactorMessage>();
         let scheduler = Arc::from(self.scheduler_supplier.compaction_scheduler(&self.options));
-        let handler = CompactorEventHandler::new(
+        let mut handler = CompactorEventHandler::new(
             self.manifest_store.clone(),
             self.compactions_store.clone(),
             self.options.clone(),
@@ -394,6 +402,16 @@ impl Compactor {
             self.recorder.clone(),
         )
         .await?;
+        // An embedded worker runs in this process, so the coordinator and the
+        // worker can wake each other instead of waiting for a poll.
+        let signals = self
+            .options
+            .worker
+            .is_some()
+            .then(CompactionSignals::default);
+        if let Some(signals) = &signals {
+            handler = handler.with_signals(signals.clone());
+        }
         self.task_executor
             .add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
@@ -422,6 +440,10 @@ impl Compactor {
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier.clone(),
             );
+            let worker_handler = match &signals {
+                Some(signals) => worker_handler.with_signals(signals.clone()),
+                None => worker_handler,
+            };
             self.task_executor
                 .add_handler(
                     crate::compaction_worker::COMPACTION_WORKER_TASK_NAME.to_string(),
@@ -524,6 +546,9 @@ pub(crate) struct CompactorEventHandler {
     /// Cached handles for per-worker `worker_last_heartbeat_ms` gauges. Handles are
     /// retained for every worker id observed by this coordinator process.
     worker_heartbeat_gauges: HashMap<String, Arc<dyn GaugeFn>>,
+    /// Signals shared with a writer and a worker in the same process. `None`
+    /// when the coordinator runs alone. See [`crate::compaction_signals`].
+    signals: Option<CompactionSignals>,
 }
 
 #[async_trait]
@@ -545,11 +570,25 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
         ]
     }
 
+    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<CompactorMessage>>> {
+        match &self.signals {
+            Some(signals) => vec![
+                signals.l0_flushed.notifier(|| CompactorMessage::L0Flushed),
+                signals
+                    .compaction_finished
+                    .notifier(|| CompactorMessage::CompactionFinished),
+            ],
+            None => vec![],
+        }
+    }
+
     async fn handle(&mut self, message: CompactorMessage) -> Result<(), SlateDBError> {
         match message {
             CompactorMessage::LogStats => self.handle_log_ticker(),
-            CompactorMessage::PollManifest => self.handle_ticker().await?,
-            CompactorMessage::CommitCompacted => {
+            CompactorMessage::PollManifest | CompactorMessage::L0Flushed => {
+                self.handle_ticker().await?
+            }
+            CompactorMessage::CommitCompacted | CompactorMessage::CompactionFinished => {
                 // A remote worker can only produce a new Compacted result for a
                 // job the coordinator already tracks as active. When there are no
                 // active jobs, the regular manifest poll is sufficient to discover
@@ -557,7 +596,14 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
                 if self.state().active_compactions().next().is_some() {
                     self.state_writer.load_compactions().await?;
                     self.update_distributed_compaction_metrics();
-                    self.commit_compacted_entries().await?;
+                    if self.commit_compacted_entries().await? {
+                        // The commit removed sources from the tree. Schedule the
+                        // next compaction now. If the writer is stalled at the L0
+                        // limit, it flushes no new L0, so no other event arrives
+                        // before the next poll.
+                        self.maybe_schedule_compactions().await?;
+                        self.maybe_validate_submitted_compactions().await?;
+                    }
                 }
             }
         }
@@ -604,7 +650,32 @@ impl CompactorEventHandler {
             recorder,
             prev_claimed: HashSet::new(),
             worker_heartbeat_gauges: HashMap::new(),
+            signals: None,
         })
+    }
+
+    /// Connects the handler to a writer and a worker in the same process. The
+    /// handler listens for [`CompactionSignals::l0_flushed`] and
+    /// [`CompactionSignals::compaction_finished`], and raises
+    /// [`CompactionSignals::compactions_scheduled`] and
+    /// [`CompactionSignals::manifest_compacted`].
+    pub(crate) fn with_signals(mut self, signals: CompactionSignals) -> Self {
+        self.signals = Some(signals);
+        self
+    }
+
+    /// Tells the worker in this process that a job is ready to claim.
+    fn signal_compactions_scheduled(&self) {
+        if let Some(signals) = &self.signals {
+            signals.compactions_scheduled.raise();
+        }
+    }
+
+    /// Tells the writer in this process to read the new manifest.
+    fn signal_manifest_compacted(&self) {
+        if let Some(signals) = &self.signals {
+            signals.manifest_compacted.raise();
+        }
     }
 
     fn state(&self) -> &CompactorState {
@@ -790,6 +861,7 @@ impl CompactorEventHandler {
         }
 
         self.state_writer.write_compactions_safely().await?;
+        self.signal_compactions_scheduled();
         self.stats.jobs_reclaimed.increment(stale.len() as u64);
         Ok(())
     }
@@ -869,7 +941,10 @@ impl CompactorEventHandler {
     /// - Crash after manifest write: sources are already absent and the manifest is
     ///   already in the correct post-compaction state, so marking `Failed` has no
     ///   effect on correctness.
-    async fn commit_compacted_entries(&mut self) -> Result<(), SlateDBError> {
+    ///
+    /// ## Returns
+    /// - `Ok(true)` if the method wrote a manifest that changes the LSM tree.
+    async fn commit_compacted_entries(&mut self) -> Result<bool, SlateDBError> {
         let compacted = self
             .state()
             .compactions_with_status(&[CompactionStatus::Compacted])
@@ -877,7 +952,7 @@ impl CompactorEventHandler {
             .collect::<Vec<_>>();
 
         if compacted.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut manifest_changed = false;
@@ -918,13 +993,14 @@ impl CompactorEventHandler {
         self.log_compaction_state();
         if manifest_changed {
             self.state_writer.write_state_safely().await?;
+            self.signal_manifest_compacted();
         } else {
             // Validation failures only change `.compactions`. Avoid creating a
             // checkpoint and writing an unchanged manifest.
             self.state_writer.write_compactions_safely().await?;
         }
 
-        Ok(())
+        Ok(manifest_changed)
     }
 
     /// Validates a Submitted compaction against the current manifest before starting it.
@@ -1203,6 +1279,7 @@ impl CompactorEventHandler {
         }
 
         let mut manifest_changed = false;
+        let mut scheduled = false;
 
         for compaction in &submitted_compactions {
             // Validate the candidate compaction; mark as failed if invalid.
@@ -1238,16 +1315,21 @@ impl CompactorEventHandler {
                     c.clear_ctx();
                     c.set_status(CompactionStatus::Scheduled)
                 });
+                scheduled = true;
             }
         }
 
         if manifest_changed {
             self.state_writer.write_state_safely().await?;
+            self.signal_manifest_compacted();
             self.stats
                 .last_compaction_ts
                 .set(self.system_clock.now().timestamp());
         } else {
             self.state_writer.write_compactions_safely().await?;
+        }
+        if scheduled {
+            self.signal_compactions_scheduled();
         }
 
         Ok(())

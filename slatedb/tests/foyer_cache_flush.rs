@@ -536,7 +536,12 @@ async fn flush_does_not_read_the_index_of_untouched_ssts() {
         "/evac-untouched-ssts",
         object_store.clone() as Arc<dyn ObjectStore>,
     )
-    .with_settings(no_periodic_flush())
+    // Disable the compactor. The in-process compactor starts a compaction as
+    // soon as L0 holds four SSTs, and this test needs all five L0 SSTs.
+    .with_settings(Settings {
+        compactor_options: None,
+        ..no_periodic_flush()
+    })
     // Disable flush-time caching so the only way an SST becomes "touched" is
     // by actually being read, isolating the signal this test checks.
     .with_block_cache_policy(BlockCachePolicy::default().with_flush_targets(&[]))
