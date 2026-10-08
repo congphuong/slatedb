@@ -62,6 +62,7 @@ use log::{debug, error, info, warn};
 use tokio::runtime::Handle;
 use ulid::Ulid;
 
+use crate::compaction_signals::CompactionSignals;
 use crate::compactions_store::{CompactionsStore, StoredCompactions};
 use crate::compactor::stats::{CompactionStats, WorkerStats};
 use crate::compactor_executor::{
@@ -71,7 +72,7 @@ use crate::compactor_executor::{
 use crate::compactor_state::{Compaction, CompactionContext, CompactionStatus, WorkerSpec};
 use crate::config::CompactionWorkerOptions;
 use crate::db_state::SortedRun;
-use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef, Notifier};
 use crate::error::SlateDBError;
 use crate::manifest::store::ManifestStore;
 use crate::manifest::ManifestCore;
@@ -194,6 +195,9 @@ pub(crate) struct CompactionWorkerHandler {
     /// [`Self::heartbeat_owned_jobs`]); progress reports themselves never
     /// write.
     job_progress: BTreeMap<Ulid, Option<CompactionContext>>,
+    /// Signals shared with a coordinator in the same process. `None` for a
+    /// standalone worker. See [`crate::compaction_signals`].
+    signals: Option<CompactionSignals>,
 }
 
 impl CompactionWorkerHandler {
@@ -218,7 +222,18 @@ impl CompactionWorkerHandler {
             rand,
             fp_registry,
             job_progress: BTreeMap::new(),
+            signals: None,
         }
+    }
+
+    /// Connects the worker to a coordinator in the same process. The worker
+    /// polls `.compactions` when the coordinator raises
+    /// [`CompactionSignals::compactions_scheduled`], and raises
+    /// [`CompactionSignals::compaction_finished`] after it writes a `Compacted`
+    /// result.
+    pub(crate) fn with_signals(mut self, signals: CompactionSignals) -> Self {
+        self.signals = Some(signals);
+        self
     }
 
     /// Builds the worker's [`CompactionWorkerHandler`] and the receiver that
@@ -589,11 +604,15 @@ impl CompactionWorkerHandler {
     /// subcompaction) for a successfully executed job. Only writes if the worker
     /// still owns the entry; otherwise it has been reclaimed and the produced
     /// SSTs become orphans (collected by GC).
+    ///
+    /// ## Returns
+    /// - `Ok(true)` if the worker wrote `Compacted`, `Ok(false)` if it no
+    ///   longer owns the entry.
     async fn write_compacted(
         &mut self,
         compaction_id: Ulid,
         sorted_run: SortedRun,
-    ) -> Result<(), SlateDBError> {
+    ) -> Result<bool, SlateDBError> {
         loop {
             let stored = self.stored.as_mut().expect(Self::EXPECT_LOADED);
             stored.refresh().await?;
@@ -603,7 +622,7 @@ impl CompactionWorkerHandler {
                     "compaction entry missing on completion; dropping [id={}]",
                     compaction_id
                 );
-                return Ok(());
+                return Ok(false);
             };
             if existing.worker().map(|w| w.worker_id.as_str()) != Some(self.worker_id.as_str()) {
                 info!(
@@ -612,7 +631,7 @@ impl CompactionWorkerHandler {
                     existing.status(),
                     existing.worker().map(|w| &w.worker_id),
                 );
-                return Ok(());
+                return Ok(false);
             }
             let heartbeat_ms = self.clock.now().timestamp_millis() as u64;
             let updated = existing
@@ -628,7 +647,7 @@ impl CompactionWorkerHandler {
                 .with_ctx(None);
             dirty.value.insert(updated);
             match stored.update(dirty).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(true),
                 Err(e) if e.is_sequenced_write_conflict() => continue,
                 Err(e) => return Err(e),
             }
@@ -696,7 +715,13 @@ impl CompactionWorkerHandler {
     ) -> Result<(), SlateDBError> {
         self.job_progress.remove(&id);
         match result {
-            Ok(sorted_run) => self.write_compacted(id, sorted_run).await?,
+            Ok(sorted_run) => {
+                if self.write_compacted(id, sorted_run).await? {
+                    if let Some(signals) = &self.signals {
+                        signals.compaction_finished.raise();
+                    }
+                }
+            }
             Err(e) => {
                 error!("compaction job failed [id={}, error={:?}]", id, e);
                 self.release_claim(id).await?;
@@ -724,6 +749,15 @@ impl MessageHandler<WorkerMessage> for CompactionWorkerHandler {
                 Box::new(|| WorkerMessage::HeartbeatOwnedJobs),
             ),
         ]
+    }
+
+    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<WorkerMessage>>> {
+        match &self.signals {
+            Some(signals) => vec![signals
+                .compactions_scheduled
+                .notifier(|| WorkerMessage::PollCompactions)],
+            None => vec![],
+        }
     }
 
     async fn handle(&mut self, message: WorkerMessage) -> Result<(), SlateDBError> {
