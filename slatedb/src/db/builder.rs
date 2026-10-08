@@ -122,6 +122,7 @@ use crate::cached_object_store::CachedObjectStore;
 use crate::clone::{SegmentFilterFn, SegmentProjectionFn};
 #[cfg(feature = "compaction_filters")]
 use crate::compaction_filter::CompactionFilterSupplier;
+use crate::compaction_signals::CompactionSignals;
 use crate::compaction_worker::{
     CompactionWorker, CompactionWorkerHandler, WorkerMessage, COMPACTION_WORKER_TASK_NAME,
 };
@@ -791,6 +792,13 @@ impl<P: Into<Path>> DbBuilder<P> {
             })
         });
 
+        // The writer and the compactor run in the same process, so they wake each
+        // other instead of waiting for their poll tickers. See
+        // `crate::compaction_signals`.
+        let compaction_signals = compactor_builder
+            .as_ref()
+            .map(|_| CompactionSignals::default());
+
         if let Some(mut compactor_builder) = compactor_builder {
             compactor_builder.options.metric_level = compactor_builder
                 .options
@@ -827,16 +835,19 @@ impl<P: Into<Path>> DbBuilder<P> {
                     compactions_store.clone(),
                 )
                 .await?;
+            let signals = compaction_signals
+                .clone()
+                .expect("signals exist when a compactor is configured");
             task_executor.add_handler(
                 COMPACTOR_TASK_NAME.to_string(),
-                Box::new(compactor_handlers.handler),
+                Box::new(compactor_handlers.handler.with_signals(signals.clone())),
                 compactor_handlers.rx,
                 &tokio_handle,
             )?;
             if let Some((worker_handler, worker_rx)) = compactor_handlers.worker {
                 task_executor.add_handler(
                     COMPACTION_WORKER_TASK_NAME.to_string(),
-                    Box::new(worker_handler),
+                    Box::new(worker_handler.with_signals(signals)),
                     worker_rx,
                     &tokio_handle,
                 )?;
@@ -908,6 +919,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             &tokio_handle,
             &task_executor,
             inner.status_manager.as_ref(),
+            compaction_signals,
         )?;
 
         // Monitor background tasks

@@ -17,6 +17,7 @@ pub(crate) use tracker::MANIFEST_REFRESH_COUNT;
 use crate::checkpoint::{
     checkpoint_outcome_unknown, CheckpointHandle, CheckpointLifecycle, CheckpointRequest,
 };
+use crate::compaction_signals::CompactionSignals;
 use crate::config::CheckpointOptions;
 use crate::db::DbInner;
 use crate::db_status::ClosedResultWriter;
@@ -70,6 +71,8 @@ impl MemtableFlusher {
         }
     }
 
+    /// Pass `signals` when a compactor runs in this process. See
+    /// [`crate::compaction_signals`].
     pub(crate) fn start(
         &self,
         inner: Arc<DbInner>,
@@ -77,6 +80,7 @@ impl MemtableFlusher {
         tokio_handle: &Handle,
         executor: &MessageHandlerExecutor,
         closed_result: &dyn ClosedResultWriter,
+        signals: Option<CompactionSignals>,
     ) -> Result<(), SlateDBError> {
         let uploader = Uploader::start(
             Arc::clone(&inner),
@@ -96,6 +100,7 @@ impl MemtableFlusher {
             tokio_handle,
             self.messages_tx.clone(),
             l0_stall_rx,
+            signals,
         )?;
 
         let tracker = FlushTracker::new(inner, uploader, manifest_writer, l0_stall_tx);

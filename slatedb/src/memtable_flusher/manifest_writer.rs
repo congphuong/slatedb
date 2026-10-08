@@ -19,6 +19,7 @@ use super::uploader::UploadedMemtable;
 use crate::checkpoint::{
     CheckpointCreateResult, CheckpointLifecycle, CheckpointRequest, CheckpointResult,
 };
+use crate::compaction_signals::CompactionSignals;
 use crate::config::CheckpointOptions;
 use crate::db::DbInner;
 use crate::db_state::{collect_touched_segments, DbState, SsTableId, SsTableView};
@@ -119,16 +120,18 @@ impl ManifestWriter {
         tokio_handle: &Handle,
         tracker_tx: SafeSender<TrackerMessage>,
         l0_stall_rx: watch::Receiver<u64>,
+        signals: Option<CompactionSignals>,
     ) -> Result<Self, SlateDBError> {
         let (commands_tx, commands_rx) =
             SafeSender::unbounded_channel(closed_result.result_reader());
-        let handler = ManifestWriterHandler::new(
+        let mut handler = ManifestWriterHandler::new(
             db,
             manifest,
             manifest_poll_interval,
             tracker_tx,
             l0_stall_rx,
         );
+        handler.signals = signals;
         executor.add_handler(
             MANIFEST_WRITER_TASK_NAME.to_string(),
             Box::new(handler),
@@ -253,6 +256,9 @@ struct ManifestWriterHandler {
     pending_flushes: Vec<PendingFlush>,
     pending_checkpoints: Vec<PendingCheckpoint>,
     pending_manifest_refreshes: Vec<oneshot::Sender<Result<(), SlateDBError>>>,
+    /// Signals shared with a compactor in the same process. `None` when no
+    /// compactor runs in this process. See [`crate::compaction_signals`].
+    signals: Option<CompactionSignals>,
 }
 
 #[async_trait]
@@ -265,7 +271,7 @@ impl MessageHandler<ManifestWriterCommand> for ManifestWriterHandler {
     }
 
     fn notifiers(&mut self) -> Vec<Box<dyn crate::dispatcher::Notifier<ManifestWriterCommand>>> {
-        vec![
+        let mut notifiers: Vec<Box<dyn crate::dispatcher::Notifier<ManifestWriterCommand>>> = vec![
             Box::new(DurableSeqNotifier {
                 rx: self.db_status_rx.clone(),
             }),
@@ -274,7 +280,18 @@ impl MessageHandler<ManifestWriterCommand> for ManifestWriterHandler {
                 Arc::clone(&self.db.system_clock),
                 self.manifest_poll_interval,
             )),
-        ]
+        ];
+        // Read the manifest as soon as the compactor in this process changes it.
+        // Without this, an L0 slot that a compaction frees stays unused until
+        // the next manifest poll.
+        if let Some(signals) = &self.signals {
+            notifiers.push(
+                signals
+                    .manifest_compacted
+                    .notifier(|| ManifestWriterCommand::PollManifest { done: None }),
+            );
+        }
+        notifiers
     }
 
     async fn handle(&mut self, command: ManifestWriterCommand) -> Result<(), SlateDBError> {
@@ -342,6 +359,7 @@ impl ManifestWriterHandler {
             l0_stall_rx,
             pending_checkpoints: Vec::new(),
             pending_manifest_refreshes: Vec::new(),
+            signals: None,
         }
     }
 
@@ -1006,6 +1024,11 @@ impl ManifestWriterHandler {
         let _ = self
             .tracker_tx
             .send(TrackerMessage::FlushComplete { through_seq });
+        // Tell the compactor in this process that L0 grew, so that it does not
+        // wait for its next manifest poll.
+        if let Some(signals) = &self.signals {
+            signals.l0_flushed.raise();
+        }
         Ok(())
     }
 
@@ -1401,6 +1424,7 @@ mod tests {
             &Handle::current(),
             tracker_tx,
             l0_stall_rx,
+            None,
         )
         .unwrap();
         executor.monitor_on(&Handle::current()).unwrap();

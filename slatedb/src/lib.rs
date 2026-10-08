@@ -117,6 +117,7 @@ mod clone;
 mod compaction_filter;
 #[cfg(feature = "compaction_filters")]
 mod compaction_filter_iterator;
+mod compaction_signals;
 mod compactions_store;
 mod compactor_executor;
 mod compactor_state;

@@ -721,6 +721,11 @@ pub struct Settings {
 
     /// How frequently to poll for new manifest files. Refreshing the manifest file
     /// allows the db to detect fencing operations and newly compacted data.
+    ///
+    /// If the compactor runs in the same process (see [`Self::compactor_options`]),
+    /// the db also refreshes the manifest each time that compactor changes it.
+    /// In that case, this poll only finds changes from other processes, for
+    /// example a fencing writer.
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub manifest_poll_interval: Duration,
@@ -1231,6 +1236,11 @@ impl FromStr for CompressionCodec {
 pub struct CompactorOptions {
     /// The interval at which the compactor checks for a new manifest and decides
     /// if a compaction must be scheduled
+    ///
+    /// If the compactor runs in the same process as the writer, the writer also
+    /// wakes the compactor each time it adds L0 SSTs. In that case, this poll
+    /// only finds changes from other processes, for example a submitted
+    /// compaction or a worker that stopped sending heartbeats.
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub poll_interval: Duration,
@@ -1364,6 +1374,9 @@ pub struct CompactionWorkerOptions {
     pub max_concurrent_compactions: usize,
 
     /// How often a worker checks `.compactions` for new jobs.
+    ///
+    /// The embedded worker (see [`CompactorOptions::worker`]) also checks each
+    /// time the coordinator in its process schedules a job.
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub compactions_poll_interval: Duration,
