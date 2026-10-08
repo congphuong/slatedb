@@ -103,11 +103,6 @@ impl WalAdmin for SlateDbWalAdmin {
         replay_after_wal_id: u64,
         wal_id_last_seen: u64,
     ) -> Result<bool, WalError> {
-        // Avoid object-store requests when the manifest's WAL range contains no file IDs.
-        if !Self::has_wal_file_ids(replay_after_wal_id, wal_id_last_seen) {
-            return Ok(true);
-        }
-
         let path_resolver = PathResolver::from_root(path.clone());
         for wal_id in (replay_after_wal_id + 1)..=wal_id_last_seen {
             let path = path_resolver.wal_sst_path(&WalFileId::from(wal_id));
@@ -122,7 +117,22 @@ impl WalAdmin for SlateDbWalAdmin {
                 return Ok(false);
             }
         }
-        Ok(true)
+
+        // The stored manifest can lag the WAL. A writer that is still open, or one that
+        // stopped without a final manifest update, can have written WAL files after
+        // `wal_id_last_seen`. WAL file IDs are consecutive, so probe the IDs after the
+        // known range until one is missing. Without this probe, a clone of such a
+        // source silently drops writes that are already durable in the WAL.
+        let mut wal_id = wal_id_last_seen.max(replay_after_wal_id) + 1;
+        loop {
+            let path = path_resolver.wal_sst_path(&WalFileId::from(wal_id));
+            match self.object_store.head(&path).await {
+                Ok(metadata) if metadata.size > 0 => return Ok(false),
+                Ok(_) => wal_id += 1,
+                Err(object_store::Error::NotFound { .. }) => return Ok(true),
+                Err(err) => return Err(WalError::Unavailable(Arc::new(err))),
+            }
+        }
     }
 
     async fn clone_wal(
@@ -161,6 +171,40 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn is_empty_probes_wal_files_after_the_manifest_range() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let wal_admin =
+            SlateDbWalAdmin::new(object_store.clone(), Arc::new(FailPointRegistry::new()));
+        let db_path = Path::from("db");
+        let resolver = PathResolver::from_root(db_path.clone());
+        let put = |id: u64, bytes: &'static [u8]| {
+            let object_store = object_store.clone();
+            let path = resolver.wal_sst_path(&WalFileId::from(id));
+            async move {
+                object_store
+                    .put(&path, Bytes::from_static(bytes).into())
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // The manifest knows WAL IDs 1..=2, and both are fences.
+        put(1, b"").await;
+        put(2, b"").await;
+        assert!(wal_admin.is_empty(&db_path, 0, 2).await.unwrap());
+
+        // An open writer wrote WAL ID 3 (a fence) and 4 (data) after the last
+        // manifest update. The stored manifest still says 2.
+        put(3, b"").await;
+        put(4, b"data").await;
+        assert!(!wal_admin.is_empty(&db_path, 0, 2).await.unwrap());
+
+        // The probe also runs when the manifest range is empty.
+        assert!(!wal_admin.is_empty(&db_path, 2, 2).await.unwrap());
+        assert!(wal_admin.is_empty(&db_path, 4, 4).await.unwrap());
+    }
 
     #[tokio::test]
     async fn delete_wal_deletes_only_objects_under_the_wal_prefix() {
