@@ -36,6 +36,10 @@ struct CopyWalParams {
     from_path: Path,
     from_manifest: VersionedManifest,
     to_path: Path,
+    /// Copy WAL files after the range that `from_manifest` records. Set for a clone of the
+    /// latest state, where the manifest of the new checkpoint can lag an open writer's WAL.
+    /// Not set for a clone of an explicit checkpoint, which is a point-in-time copy.
+    include_wal_tail: bool,
 }
 
 struct CreateCloneManifestResult {
@@ -154,7 +158,11 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                             segment_projection.as_ref(),
                         )
                         .await?;
-                        Some(copy_wal_params_for_source(&source, &clone_path))
+                        Some(copy_wal_params_for_source(
+                            &source,
+                            &clone_path,
+                            source_spec.checkpoint.is_none(),
+                        ))
                     }
                     _ => None,
                 };
@@ -172,7 +180,11 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                 )
                 .await?;
                 let copy_wal_params = match &sources[..] {
-                    [source] => Some(copy_wal_params_for_source(source, &clone_path)),
+                    [source] => Some(copy_wal_params_for_source(
+                        source,
+                        &clone_path,
+                        source_specs[0].checkpoint.is_none(),
+                    )),
                     _ => None,
                 };
 
@@ -382,11 +394,16 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
     })
 }
 
-fn copy_wal_params_for_source(source: &CloneSource, to_path: &Path) -> CopyWalParams {
+fn copy_wal_params_for_source(
+    source: &CloneSource,
+    to_path: &Path,
+    include_wal_tail: bool,
+) -> CopyWalParams {
     CopyWalParams {
         from_path: source.path.clone(),
         from_manifest: source.versioned_manifest(),
         to_path: to_path.clone(),
+        include_wal_tail,
     }
 }
 
@@ -601,9 +618,20 @@ async fn copy_wal(
 ) -> Result<(u64, u64), SlateDBError> {
     let CopyWalParams {
         from_path,
-        from_manifest,
+        mut from_manifest,
         to_path,
+        include_wal_tail,
     } = params;
+    if include_wal_tail {
+        let wal_id_last_seen = from_manifest
+            .manifest
+            .core
+            .next_wal_sst_id
+            .checked_sub(1)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let tail = wal_admin.wal_tail(&from_path, wal_id_last_seen).await?;
+        from_manifest.manifest.core.next_wal_sst_id = tail + 1;
+    }
     wal_admin
         .clone_wal(&from_path, from_manifest, &to_path)
         .await
@@ -1078,6 +1106,42 @@ mod tests {
         let mut db_iter = clone_db.scan(..).await.unwrap();
         test_utils::assert_ranged_db_scan(&table, .., IterationOrder::Ascending, &mut db_iter)
             .await;
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_clone_wal_written_after_the_manifest_of_an_open_source() {
+        let object_store = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_open");
+        let clone_path = Path::from("/tmp/test_clone_open");
+
+        let parent_db = Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        // The write is durable in the WAL, but the open writer has not recorded the
+        // WAL file in the stored manifest yet.
+        parent_db.put(b"k", b"v").await.unwrap();
+        parent_db.flush().await.unwrap();
+
+        create_clone(
+            clone_path.clone(),
+            parent_path.clone(),
+            object_store.clone(),
+            object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+        parent_db.close().await.unwrap();
+
+        let clone_db = Db::open(clone_path, object_store.clone()).await.unwrap();
+        assert_eq!(
+            clone_db.get(b"k").await.unwrap(),
+            Some(Bytes::from_static(b"v"))
+        );
         clone_db.close().await.unwrap();
     }
 
