@@ -334,6 +334,8 @@ impl FlatBufferManifestCodec {
             // Segmentation is V2-only. V1 manifests are always unsegmented.
             segments: vec![],
             segment_extractor_name: None,
+            // V1 manifests predate pluggable WALs.
+            wal_name: None,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
             last_l0_seq: manifest.last_l0_seq(),
@@ -400,6 +402,7 @@ impl FlatBufferManifestCodec {
         // even if the on-disk order happens to differ.
         segments.sort_by(|a, b| a.prefix.cmp(&b.prefix));
         let segment_extractor_name = manifest.segment_extractor_name().map(|s| s.to_string());
+        let wal_name = manifest.wal_name().map(|s| s.to_string());
         let checkpoints: Vec<checkpoint::Checkpoint> = manifest
             .checkpoints()
             .iter()
@@ -451,6 +454,7 @@ impl FlatBufferManifestCodec {
             tree: Arc::new(tree),
             segments,
             segment_extractor_name,
+            wal_name,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
             last_l0_seq: manifest.last_l0_seq(),
@@ -1290,6 +1294,10 @@ impl<'b> DbFlatBufferBuilder<'b> {
             .segment_extractor_name
             .as_ref()
             .map(|name| self.builder.create_string(name));
+        let wal_name = core
+            .wal_name
+            .as_ref()
+            .map(|name| self.builder.create_string(name));
         let checkpoints = self.add_checkpoints(&core.checkpoints);
         let external_dbs = if manifest.external_dbs.is_empty() {
             None
@@ -1336,6 +1344,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 sequence_tracker: Some(sequence_tracker),
                 segments: Some(segments),
                 segment_extractor_name,
+                wal_name,
             },
         );
         self.builder.finish(manifest, None);
@@ -1948,6 +1957,35 @@ mod tests {
 
         assert!(decoded.core.segments.is_empty());
         assert!(decoded.core.segment_extractor_name.is_none());
+        assert!(decoded.core.wal_name.is_none());
+    }
+
+    #[test]
+    fn test_should_round_trip_wal_name() {
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest.core.wal_name = Some("custom-wal/1".to_string());
+        let codec = FlatBufferManifestCodec {};
+
+        let decoded = codec
+            .decode(&codec.encode(&manifest))
+            .expect("failed to decode manifest");
+
+        assert_eq!(decoded.core.wal_name.as_deref(), Some("custom-wal/1"));
+        assert_eq!(manifest, decoded);
+    }
+
+    #[test]
+    fn test_v1_manifest_has_no_wal_name() {
+        // V1 manifests predate pluggable WALs, so they decode as the native WAL.
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest.core.wal_name = Some("custom-wal/1".to_string());
+        let codec = FlatBufferManifestCodec {};
+
+        let decoded = codec
+            .decode(&FlatBufferManifestCodec::create_from_manifest_v1(&manifest))
+            .expect("failed to decode manifest");
+
+        assert!(decoded.core.wal_name.is_none());
     }
 
     #[test]

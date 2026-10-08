@@ -35,8 +35,9 @@ use ulid::Ulid;
 use uuid::Uuid;
 
 pub use crate::db::builder::AdminBuilder;
+use crate::garbage_collector::wal_gc::WalGcTask;
 use crate::merge_operator::MergeOperatorType;
-use crate::wal::WalAdmin;
+use crate::wal::{WalAdmin, WalFileRange};
 use slatedb_txn_obj::TransactionalObject;
 
 /// An Admin struct for SlateDB administration operations.
@@ -549,6 +550,73 @@ impl Admin {
                 }) else {
                     return Err(SlateDBError::InvalidDBState);
                 };
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Returns the ranges of WAL file IDs that the latest manifest and every live checkpoint
+    /// of the database reference.
+    ///
+    /// The garbage collector of SlateDB passes the same ranges to [`crate::wal::WalGc::collect`].
+    /// A WAL implementation that stores the rows of several databases in shared objects uses
+    /// this function for a database that has no garbage collector task in the same process.
+    pub async fn referenced_wal_ranges(&self) -> Result<Vec<WalFileRange>, crate::Error> {
+        let manifest_store = self.manifest_store();
+        let latest = manifest_store.read_latest_manifest().await?;
+        let active = manifest_store
+            .read_referenced_manifests(latest.id, &latest.manifest)
+            .await?;
+        Ok(WalGcTask::referenced_wal_ranges(latest.id, &active))
+    }
+
+    /// Changes the WAL implementation that the manifest records (see
+    /// [`crate::wal::WriterInit::wal_name`]). `None` is the native SlateDB WAL.
+    ///
+    /// The change is allowed only when the WAL holds no rows after the replay point. SlateDB
+    /// makes sure of this in two ways. First, the manifest must record no WAL file after the
+    /// replay point. Second, the WAL implementation of this admin must be the current one, and
+    /// it must report an empty WAL with no files after the manifest records.
+    ///
+    /// Close every writer of the database before you call this function. An open writer
+    /// continues to write rows to the old WAL, and a writer with the new WAL does not see them.
+    pub async fn set_wal_name(&self, wal_name: Option<&str>) -> Result<(), crate::Error> {
+        let manifest_store = Arc::new(self.manifest_store());
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+        let core = stored_manifest.db_state().clone();
+        if core.wal_name.as_deref() == wal_name {
+            return Ok(());
+        }
+        core.validate_wal_name(self.wal_admin.wal_name())?;
+        let last_seen = core
+            .next_wal_sst_id
+            .checked_sub(1)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let tail = self
+            .wal_admin
+            .wal_tail(&self.path, last_seen)
+            .await
+            .map_err(SlateDBError::from)?;
+        let empty = core.wal_range_is_empty()
+            && tail == last_seen
+            && self
+                .wal_admin
+                .is_empty(&self.path, core.replay_after_wal_id, last_seen)
+                .await
+                .map_err(SlateDBError::from)?;
+        if !empty {
+            return Err(SlateDBError::WalNotEmpty.into());
+        }
+        let new_name = wal_name.map(str::to_string);
+        stored_manifest
+            .maybe_apply_update(|stored_manifest| {
+                let mut dirty = stored_manifest.prepare_dirty()?;
+                if !dirty.value.core.wal_range_is_empty() {
+                    return Err(SlateDBError::WalNotEmpty);
+                }
+                dirty.value.core.wal_name = new_name.clone();
                 Ok(Some(dirty))
             })
             .await

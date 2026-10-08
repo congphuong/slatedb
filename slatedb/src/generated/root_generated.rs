@@ -4237,6 +4237,7 @@ impl<'a> ManifestV2<'a> {
   pub const VT_SEQUENCE_TRACKER: flatbuffers::VOffsetT = 34;
   pub const VT_SEGMENTS: flatbuffers::VOffsetT = 36;
   pub const VT_SEGMENT_EXTRACTOR_NAME: flatbuffers::VOffsetT = 38;
+  pub const VT_WAL_NAME: flatbuffers::VOffsetT = 40;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -4256,6 +4257,7 @@ impl<'a> ManifestV2<'a> {
     builder.add_compactor_epoch(args.compactor_epoch);
     builder.add_writer_epoch(args.writer_epoch);
     builder.add_manifest_id(args.manifest_id);
+    if let Some(x) = args.wal_name { builder.add_wal_name(x); }
     if let Some(x) = args.segment_extractor_name { builder.add_segment_extractor_name(x); }
     if let Some(x) = args.segments { builder.add_segments(x); }
     if let Some(x) = args.sequence_tracker { builder.add_sequence_tracker(x); }
@@ -4396,6 +4398,13 @@ impl<'a> ManifestV2<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, None)}
   }
+  #[inline]
+  pub fn wal_name(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_WAL_NAME, None)}
+  }
 }
 
 impl flatbuffers::Verifiable for ManifestV2<'_> {
@@ -4423,6 +4432,7 @@ impl flatbuffers::Verifiable for ManifestV2<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, u8>>>("sequence_tracker", Self::VT_SEQUENCE_TRACKER, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Segment>>>>("segments", Self::VT_SEGMENTS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("segment_extractor_name", Self::VT_SEGMENT_EXTRACTOR_NAME, false)?
+     .visit_field::<flatbuffers::ForwardsUOffset<&str>>("wal_name", Self::VT_WAL_NAME, false)?
      .finish();
     Ok(())
   }
@@ -4446,6 +4456,7 @@ pub struct ManifestV2Args<'a> {
     pub sequence_tracker: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, u8>>>,
     pub segments: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Segment<'a>>>>>,
     pub segment_extractor_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub wal_name: Option<flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for ManifestV2Args<'a> {
   #[inline]
@@ -4469,6 +4480,7 @@ impl<'a> Default for ManifestV2Args<'a> {
       sequence_tracker: None,
       segments: None,
       segment_extractor_name: None,
+      wal_name: None,
     }
   }
 }
@@ -4551,6 +4563,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ManifestV2Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, segment_extractor_name);
   }
   #[inline]
+  pub fn add_wal_name(&mut self, wal_name: flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_WAL_NAME, wal_name);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> ManifestV2Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     ManifestV2Builder {
@@ -4590,6 +4606,7 @@ impl core::fmt::Debug for ManifestV2<'_> {
       ds.field("sequence_tracker", &self.sequence_tracker());
       ds.field("segments", &self.segments());
       ds.field("segment_extractor_name", &self.segment_extractor_name());
+      ds.field("wal_name", &self.wal_name());
       ds.finish()
   }
 }

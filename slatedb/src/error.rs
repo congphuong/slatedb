@@ -107,6 +107,17 @@ pub(crate) enum SlateDBError {
         configured: Option<String>,
     },
 
+    #[error("WAL implementation mismatch (persisted: {persisted:?}, configured: {configured:?})")]
+    WalNameMismatch {
+        persisted: Option<String>,
+        configured: Option<String>,
+    },
+
+    #[error(
+        "cannot change the WAL implementation while the WAL holds rows after the replay point"
+    )]
+    WalNotEmpty,
+
     #[error(
         "segment prefix {prefix:?} is not recognized by the configured extractor `{extractor}`"
     )]
@@ -684,6 +695,8 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidSegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::RecencyScanPrefixSpansMultipleSegments => Error::invalid(msg),
             SlateDBError::SegmentExtractorMismatch { .. } => Error::invalid(msg),
+            SlateDBError::WalNameMismatch { .. } => Error::invalid(msg),
+            SlateDBError::WalNotEmpty => Error::invalid(msg),
             SlateDBError::SegmentPrefixNotRecognized { .. } => Error::invalid(msg),
             SlateDBError::EmptySegmentPrefix { .. } => Error::invalid(msg),
             SlateDBError::InvalidClockTick { .. } => Error::invalid(msg),

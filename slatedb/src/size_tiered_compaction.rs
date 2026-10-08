@@ -1724,6 +1724,7 @@ mod tests {
             }),
             segments: vec![],
             segment_extractor_name: None,
+            wal_name: None,
             next_wal_sst_id: 0,
             replay_after_wal_id: 0,
             last_l0_seq: 0,
