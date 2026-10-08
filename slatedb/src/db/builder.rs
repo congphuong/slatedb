@@ -2031,8 +2031,11 @@ pub struct CloneSourceSpec<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<
     pub path: Path,
     /// Optional checkpoint ID to clone from. If None, the latest state is used.
     pub checkpoint: Option<Uuid>,
-    /// Optional range to limit the visible keys in the source database.
-    pub projection_range: Option<R>,
+    /// Optional ranges to limit the visible keys in the source database. A key
+    /// is visible when one of the ranges contains it. If None, all keys are
+    /// visible. The list must not be empty, and each range must not be empty.
+    /// The ranges can overlap.
+    pub projection_ranges: Option<Vec<R>>,
 }
 
 impl<R: RangeBounds<Bytes> + Clone> Clone for CloneSourceSpec<R> {
@@ -2040,15 +2043,27 @@ impl<R: RangeBounds<Bytes> + Clone> Clone for CloneSourceSpec<R> {
         CloneSourceSpec {
             path: self.path.clone(),
             checkpoint: self.checkpoint,
-            projection_range: self.projection_range.clone(),
+            projection_ranges: self.projection_ranges.clone(),
         }
     }
 }
 
 impl<R: RangeBounds<Bytes> + Clone> CloneSourceSpec<R> {
     /// Set the visible range to limit the keys visible in the source database.
-    pub fn with_projection_range(mut self, range: R) -> Self {
-        self.projection_range = Some(range);
+    ///
+    /// This is the same as [`Self::with_projection_ranges`] with one range.
+    pub fn with_projection_range(self, range: R) -> Self {
+        self.with_projection_ranges([range])
+    }
+
+    /// Set the visible ranges to limit the keys visible in the source
+    /// database. A key is visible when one of the ranges contains it.
+    ///
+    /// Use this to keep keys in more than one part of the key space. For
+    /// example, a key space with the tenant ID after a one-byte region tag
+    /// keeps one tenant range in each region.
+    pub fn with_projection_ranges(mut self, ranges: impl IntoIterator<Item = R>) -> Self {
+        self.projection_ranges = Some(ranges.into_iter().collect());
         self
     }
 }
@@ -2059,7 +2074,7 @@ impl CloneSourceSpec<(Bound<Bytes>, Bound<Bytes>)> {
         CloneSourceSpec {
             path: path.into(),
             checkpoint: None,
-            projection_range: None,
+            projection_ranges: None,
         }
     }
 
@@ -2068,7 +2083,7 @@ impl CloneSourceSpec<(Bound<Bytes>, Bound<Bytes>)> {
         CloneSourceSpec {
             path: path.into(),
             checkpoint: Some(checkpoint),
-            projection_range: None,
+            projection_ranges: None,
         }
     }
 }
@@ -2082,7 +2097,7 @@ pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Byt
     wal_admin: Option<Arc<dyn WalAdmin>>,
     system_clock: Option<Arc<dyn SystemClock>>,
     rand: Option<Arc<DbRand>>,
-    projection_range: Option<R>,
+    projection_ranges: Option<Vec<R>>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
 }
@@ -2101,7 +2116,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             wal_admin: None,
             system_clock: None,
             rand: None,
-            projection_range: None,
+            projection_ranges: None,
             segment_filter: None,
             segment_projection: None,
         }
@@ -2132,8 +2147,20 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
         self
     }
 
-    pub fn with_projection_range(mut self, projection_range: Option<R>) -> Self {
-        self.projection_range = projection_range;
+    /// Set a range that applies to every source. The clone keeps a key of a
+    /// source only when this range and the source's own projection ranges
+    /// contain it.
+    ///
+    /// This is the same as [`Self::with_projection_ranges`] with one range.
+    pub fn with_projection_range(self, projection_range: Option<R>) -> Self {
+        self.with_projection_ranges(projection_range.map(|range| vec![range]))
+    }
+
+    /// Set ranges that apply to every source. A key is in these ranges when
+    /// one of them contains it. The clone keeps a key of a source only when
+    /// these ranges and the source's own projection ranges contain it.
+    pub fn with_projection_ranges(mut self, projection_ranges: Option<Vec<R>>) -> Self {
+        self.projection_ranges = projection_ranges;
         self
     }
 
@@ -2153,7 +2180,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
     /// and returns the range to retain. The returned range's bounded ends must
     /// fall within `[prefix, prefix++)`; `Unbounded` ends resolve to the
     /// segment edges. The result is intersected with any global
-    /// `projection_range`. Empty returned ranges surface as
+    /// `projection_ranges`. Empty returned ranges surface as
     /// `SlateDBError::InvalidProjection`.
     pub fn with_segment_projection<F, Range>(mut self, f: F) -> Self
     where
@@ -2204,7 +2231,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             self.system_clock
                 .unwrap_or_else(|| Arc::new(DefaultSystemClock::new())),
             self.rand.unwrap_or_else(|| Arc::new(Default::default())),
-            self.projection_range,
+            self.projection_ranges,
             self.segment_filter,
             self.segment_projection,
         )

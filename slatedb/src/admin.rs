@@ -779,9 +779,9 @@ impl Admin {
     /// New writes will be written to the newly created db and will not be reflected in the
     /// parent database.
     ///
-    /// The first source's [`CloneSourceSpec`] is passed directly, so any `projection_range`
-    /// already set on it is preserved.  This matters when multiple sources are combined via
-    /// [`CloneBuilder::with_source`]: each source must carry its own per-source range so that
+    /// The first source's [`CloneSourceSpec`] is passed directly, so any `projection_ranges`
+    /// already set on it are preserved.  This matters when multiple sources are combined via
+    /// [`CloneBuilder::with_source`]: each source must carry its own per-source ranges so that
     /// [`crate::manifest::Manifest::cloned_from_union`] sees non-overlapping effective ranges.
     ///
     /// Segmented sources only have to be non-overlapping within each segment that they share.

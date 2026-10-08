@@ -263,6 +263,7 @@ fn compute_lower_bound(prev_block_last_key: &Bytes, this_block_first_key: &Bytes
 pub(crate) trait IdGenerator {
     fn gen_uuid(&mut self) -> Uuid;
     fn gen_ulid(&mut self, clock: &dyn SystemClock) -> Ulid;
+    fn gen_ulid_at(&mut self, timestamp_ms: u64) -> Ulid;
 }
 
 impl<R: RngCore> IdGenerator for R {
@@ -284,6 +285,12 @@ impl<R: RngCore> IdGenerator for R {
             .expect("timestamp outside u64 range in gen_ulid");
         let random_bytes = self.random::<u128>();
         Ulid::from_parts(now, random_bytes)
+    }
+
+    /// Generates a random ULID with the given timestamp component. Use this to
+    /// give a copy of an object a new ID that keeps the time of the original.
+    fn gen_ulid_at(&mut self, timestamp_ms: u64) -> Ulid {
+        Ulid::from_parts(timestamp_ms, self.random::<u128>())
     }
 }
 

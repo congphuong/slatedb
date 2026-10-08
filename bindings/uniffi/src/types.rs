@@ -856,9 +856,9 @@ impl TryInto<slatedb::CloneSourceSpec> for CloneSourceSpec {
                         .map_err(|source| SlateDbError::InvalidCheckpointId { source })
                 })
                 .transpose()?,
-            projection_range: self
+            projection_ranges: self
                 .projection_range
-                .map(|key_range| key_range.into_range_bounds())
+                .map(|key_range| key_range.into_range_bounds().map(|range| vec![range]))
                 .transpose()?,
         })
     }
