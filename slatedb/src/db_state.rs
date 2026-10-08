@@ -927,6 +927,8 @@ impl<'a> StateModifier<'a> {
             segments,
             // Segment configuration is stable; the writer is the source of truth.
             segment_extractor_name: my_db_state.segment_extractor_name.clone(),
+            // The writer owns the WAL configuration.
+            wal_name: my_db_state.wal_name.clone(),
             next_wal_sst_id: my_db_state.next_wal_sst_id,
             replay_after_wal_id: my_db_state.replay_after_wal_id,
             last_l0_clock_tick: my_db_state.last_l0_clock_tick,

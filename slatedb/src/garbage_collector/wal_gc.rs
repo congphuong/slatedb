@@ -45,7 +45,7 @@ impl WalGcTask {
         }
     }
 
-    fn referenced_wal_ranges(
+    pub(crate) fn referenced_wal_ranges(
         latest_manifest_id: u64,
         active_manifests: &BTreeMap<u64, Manifest>,
     ) -> Vec<WalFileRange> {

@@ -633,6 +633,20 @@ impl<P: Into<Path>> DbBuilder<P> {
                 .validate_extractor_configuration(self.segment_extractor.as_deref())?;
         }
 
+        // RFC-0030: the configured WAL implementation must be the one that the manifest
+        // records. Rows in one WAL implementation are not visible to another one. For a
+        // fresh database the name (if any) is stamped onto the new manifest below.
+        let wal_name = self
+            .wal_writer_init
+            .as_ref()
+            .and_then(|init| init.wal_name())
+            .map(str::to_string);
+        if let Some(latest_manifest) = &latest_manifest {
+            latest_manifest
+                .db_state()
+                .validate_wal_name(wal_name.as_deref())?;
+        }
+
         // Extract external SSTs from manifest if available
         let external_ssts = match &latest_manifest {
             Some(latest_stored_manifest) => latest_stored_manifest.manifest().external_ssts(),
@@ -679,6 +693,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 if let Some(extractor) = &self.segment_extractor {
                     state.segment_extractor_name = Some(extractor.name().to_string());
                 }
+                state.wal_name = wal_name;
                 StoredManifest::create_new_db(manifest_store.clone(), state, system_clock.clone())
                     .await?
             }

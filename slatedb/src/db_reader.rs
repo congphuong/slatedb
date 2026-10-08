@@ -4,7 +4,7 @@ use {
         bytes_range::{ByteRangeBounds, BytesRange},
         cached_object_store::CachedObjectStore,
         clock::MonotonicClock,
-        config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions},
+        config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions, WalFollowMode},
         db_cache::CacheTarget,
         db_cache_manager,
         db_common::extract_segment_prefix,
@@ -28,6 +28,7 @@ use {
         utils::IdGenerator,
         wal::slatedb::store::WalTableStore,
         wal::WalReader as WalReaderTrait,
+        wal::{WalError, WalFileRange, WalIterator, WalRows},
         wal_replay::{WalReplayIterator, WalReplayOptions},
         Checkpoint, DbCacheManagerOps, DbIterator, DbMetadataOps, DbReadOps,
     },
@@ -40,7 +41,7 @@ use {
     slatedb_common::{clock::SystemClock, DbRand},
     std::{
         collections::{BTreeSet, VecDeque},
-        ops::Sub,
+        ops::{Bound, Sub},
         sync::{Arc, LazyLock},
     },
     tokio::runtime::Handle,
@@ -111,6 +112,8 @@ impl WalReplayEnd {
 pub struct DbReader {
     inner: Arc<DbReaderInner>,
     task_executor: MessageHandlerExecutor,
+    /// The WAL stream task, when [`DbReaderOptions::wal_follow`] is [`WalFollowMode::Stream`].
+    stream_task: parking_lot::Mutex<Option<StreamTask>>,
 }
 
 struct DbReaderInner {
@@ -126,6 +129,10 @@ struct DbReaderInner {
     status_manager: DbStatusManager,
     segment_extractor: Option<Arc<dyn PrefixExtractor>>,
     rand: Arc<DbRand>,
+    /// Serializes the tasks that read the current state and install a new one (the manifest
+    /// poller and the WAL stream task), so that one task does not overwrite the state that
+    /// the other task installed.
+    replay_lock: tokio::sync::Mutex<()>,
     /// Kept alive so the underlying `MetricsRecorder` is not dropped while
     /// metric handles in `DbStats` (and other stats structs) are still in use.
     /// See: https://github.com/slatedb/slatedb/issues/1469
@@ -136,6 +143,34 @@ struct DbReaderInner {
 #[derive(Debug)]
 enum DbReaderMessage {
     PollManifest,
+}
+
+/// The result of a WAL replay into the immutable memtables of a reader.
+struct ReplayedWal {
+    last_wal_id: u64,
+    last_committed_seq: u64,
+    /// The replay stopped because the WAL was truncated under it.
+    truncated: bool,
+}
+
+/// A [`WalIterator`] that returns one [`WalRows`] and then ends. A streaming reader uses it to
+/// apply each batch of rows from an unbounded iterator through the bounded replay path.
+struct OnceWalIterator(Option<WalRows>);
+
+#[async_trait]
+impl WalIterator for OnceWalIterator {
+    async fn next(&mut self) -> Result<Option<WalRows>, WalError> {
+        Ok(self.0.take())
+    }
+}
+
+/// Aborts the WAL stream task of a reader when the reader is dropped or closed.
+struct StreamTask(tokio::task::JoinHandle<()>);
+
+impl Drop for StreamTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -272,6 +307,7 @@ impl DbReaderInner {
             status_manager,
             segment_extractor,
             rand,
+            replay_lock: tokio::sync::Mutex::new(()),
             recorder,
         };
         Ok(inner)
@@ -404,8 +440,16 @@ impl DbReaderInner {
             .report_manifest_and_memtable_segments(versioned_manifest, touched_segments);
     }
 
+    /// True if this reader follows the WAL with a stream task instead of polling it.
+    fn streams_wal(&self) -> bool {
+        self.options.wal_follow == WalFollowMode::Stream
+            && !self.options.skip_wal_replay
+            && !matches!(self.mode, DbReaderMode::Checkpoint(_))
+    }
+
     async fn maybe_replay_new_wals(&self) -> Result<(), SlateDBError> {
-        if self.options.skip_wal_replay {
+        // A streaming reader gets new WAL rows from its stream task.
+        if self.options.skip_wal_replay || self.streams_wal() {
             return Ok(());
         }
         let current_state = Arc::clone(&self.state.read());
@@ -420,7 +464,121 @@ impl DbReaderInner {
             self.segment_extractor.as_ref(),
         )
         .await?;
+        self.install_replayed(
+            &current_state,
+            imm_memtable,
+            last_wal_id,
+            last_committed_seq,
+        );
+        Ok(())
+    }
 
+    /// Follows the WAL with an unbounded [`WalIterator`] and applies each batch of rows as it
+    /// arrives. The task runs until the reader is dropped or closed. If an iterator fails, the
+    /// task waits one poll interval and starts a new iterator at the current watermark.
+    async fn stream_wal(self: Arc<Self>) {
+        let mut last_truncation = None;
+        loop {
+            match self.stream_wal_once().await {
+                Ok(Some(start)) => {
+                    // A new iterator at the same start found the same gap. The manifest that
+                    // covers the gap is not visible yet, so wait before the next try.
+                    if last_truncation == Some(start) {
+                        self.system_clock
+                            .sleep(self.options.manifest_poll_interval)
+                            .await;
+                    }
+                    last_truncation = Some(start);
+                }
+                Ok(None) => last_truncation = None,
+                Err(err) => {
+                    warn!("reader WAL stream failed, restarting [error={err:?}]");
+                    self.system_clock
+                        .sleep(self.options.manifest_poll_interval)
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Streams the WAL from the current watermark until the iterator ends or reports that the
+    /// WAL was truncated. On truncation, the reader loads the latest manifest at once, because
+    /// the rows that it missed are now in the LSM tree, and returns the start of the iterator
+    /// that found the gap. The caller then starts a new iterator at the new watermark.
+    async fn stream_wal_once(&self) -> Result<Option<u64>, SlateDBError> {
+        let start = self
+            .state
+            .read()
+            .last_wal_id
+            .checked_add(1)
+            .ok_or(SlateDBError::InvalidDBState)?;
+        let mut iter = self
+            .wal_reader
+            .iterator(WalFileRange(Bound::Included(start), Bound::Unbounded))
+            .await?;
+        loop {
+            let truncated = match iter.next().await {
+                Ok(Some(rows)) => {
+                    let _guard = self.replay_lock.lock().await;
+                    self.apply_streamed_rows(rows).await?
+                }
+                Ok(None) => {
+                    // An iterator with no end must not end. Wait so that a new iterator
+                    // does not start in a tight loop.
+                    self.system_clock
+                        .sleep(self.options.manifest_poll_interval)
+                        .await;
+                    return Ok(None);
+                }
+                Err(WalError::WalTruncated(_)) => true,
+                Err(err) => return Err(err.into()),
+            };
+            if truncated {
+                // A managed-checkpoint reader moves its checkpoint in the manifest poller.
+                if self.mode == DbReaderMode::FollowLatest {
+                    let _guard = self.replay_lock.lock().await;
+                    self.refresh_latest_manifest().await?;
+                }
+                return Ok(Some(start));
+            }
+        }
+    }
+
+    /// Applies one batch of streamed rows. Returns true if the WAL was truncated. The caller
+    /// must hold `replay_lock`.
+    async fn apply_streamed_rows(&self, rows: WalRows) -> Result<bool, SlateDBError> {
+        let current_state = Arc::clone(&self.state.read());
+        if rows.last_consumed_wal_file_id <= current_state.last_wal_id {
+            // The manifest poller already replayed these rows.
+            return Ok(false);
+        }
+        let mut imm_memtable = current_state.imm_memtable().clone();
+        let replayed = Self::replay_iter_into(
+            Arc::clone(&self.table_store),
+            &self.options,
+            current_state.core(),
+            &mut imm_memtable,
+            Box::new(OnceWalIterator(Some(rows))),
+            self.segment_extractor.as_ref(),
+        )
+        .await?;
+        self.install_replayed(
+            &current_state,
+            imm_memtable,
+            replayed.last_wal_id,
+            replayed.last_committed_seq,
+        );
+        Ok(replayed.truncated)
+    }
+
+    /// Installs the immutable memtables that a WAL replay built on top of `current_state`.
+    fn install_replayed(
+        &self,
+        current_state: &Arc<ReaderState>,
+        imm_memtable: VecDeque<Arc<ImmutableMemtable>>,
+        last_wal_id: u64,
+        last_committed_seq: u64,
+    ) {
         if last_wal_id > current_state.last_wal_id {
             self.oracle.advance_durable_seq(last_committed_seq);
             let mut write_guard = self.state.write();
@@ -436,7 +594,6 @@ impl DbReaderInner {
             self.status_manager
                 .report_memtable_segments(collect_touched_segments(self.state.read().as_ref()));
         }
-        Ok(())
     }
 
     async fn rebuild_checkpoint_state(
@@ -666,8 +823,7 @@ impl DbReaderInner {
         replay_end: WalReplayEnd,
         segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
     ) -> Result<(u64, u64), SlateDBError> {
-        let (mut replay_after_wal_id, mut last_committed_seq) =
-            Self::replayed_watermark(core, into_tables);
+        let (replay_after_wal_id, last_committed_seq) = Self::replayed_watermark(core, into_tables);
         let wal_id_start = replay_after_wal_id
             .checked_add(1)
             .ok_or(SlateDBError::InvalidDBState)?;
@@ -683,16 +839,40 @@ impl DbReaderInner {
             return Ok((replay_after_wal_id, last_committed_seq));
         }
 
+        let wal_iter = wal_reader
+            .iterator((wal_id_start..wal_id_end).into())
+            .await?;
+        let replayed = Self::replay_iter_into(
+            table_store,
+            reader_options,
+            core,
+            into_tables,
+            wal_iter,
+            segment_extractor,
+        )
+        .await?;
+        Ok((replayed.last_wal_id, replayed.last_committed_seq))
+    }
+
+    /// Replays every row that `wal_iter` returns into `into_tables`, starting at the
+    /// watermark that `into_tables` (or the manifest) already reached. A truncated WAL ends
+    /// the replay. The result reports it so that a streaming reader can refresh its manifest.
+    async fn replay_iter_into(
+        table_store: Arc<TableStore>,
+        reader_options: &DbReaderOptions,
+        core: &ManifestCore,
+        into_tables: &mut VecDeque<Arc<ImmutableMemtable>>,
+        wal_iter: Box<dyn WalIterator>,
+        segment_extractor: Option<&Arc<dyn PrefixExtractor>>,
+    ) -> Result<ReplayedWal, SlateDBError> {
+        let (mut replay_after_wal_id, mut last_committed_seq) =
+            Self::replayed_watermark(core, into_tables);
         let replay_options = WalReplayOptions {
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             // Skip entries that we already have in `imm_memtable` (that might be above
             // last_l0_seq).
             min_seq: Some(last_committed_seq),
         };
-
-        let wal_iter = wal_reader
-            .iterator((wal_id_start..wal_id_end).into())
-            .await?;
         let mut replay_iter = WalReplayIterator::for_wal_iterator(
             wal_iter,
             core,
@@ -700,10 +880,14 @@ impl DbReaderInner {
             Arc::clone(&table_store),
         )?;
 
+        let mut truncated = false;
         while let Some(replayed_table) = match replay_iter.next().await {
             Ok(Some(replayed_table)) => Some(replayed_table),
             Ok(None) => None,
-            Err(SlateDBError::WalTruncated(_)) => None,
+            Err(SlateDBError::WalTruncated(_)) => {
+                truncated = true;
+                None
+            }
             Err(err) => return Err(err),
         } {
             // `last_wal_id` is a conservative watermark: a table that ends mid-file
@@ -733,7 +917,11 @@ impl DbReaderInner {
             }
         }
 
-        Ok((replay_after_wal_id, last_committed_seq))
+        Ok(ReplayedWal {
+            last_wal_id: replay_after_wal_id,
+            last_committed_seq,
+            truncated,
+        })
     }
 
     /// Re-derive each replayed entry's segment prefix (RFC-0024) and record the
@@ -797,6 +985,8 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
         assert!(matches!(message, DbReaderMessage::PollManifest));
+        let inner = Arc::clone(&self.inner);
+        let _guard = inner.replay_lock.lock().await;
         match self.inner.mode {
             DbReaderMode::ManagedCheckpoint => {
                 let mut manifest = StoredManifest::load(
@@ -985,6 +1175,10 @@ impl DbReader {
         manifest
             .db_state()
             .validate_extractor_configuration(segment_extractor.as_deref())?;
+        // RFC-0030: read the WAL with the implementation that the manifest records.
+        manifest
+            .db_state()
+            .validate_wal_name(wal_reader.as_ref().and_then(|reader| reader.wal_name()))?;
 
         let inner = Arc::new(
             DbReaderInner::new(
@@ -1013,10 +1207,14 @@ impl DbReader {
         if !matches!(mode, DbReaderMode::Checkpoint(_)) {
             inner.spawn_manifest_poller(&task_executor)?;
         }
+        let stream_task = inner
+            .streams_wal()
+            .then(|| StreamTask(tokio::spawn(Arc::clone(&inner).stream_wal())));
 
         Ok(Self {
             inner,
             task_executor,
+            stream_task: parking_lot::Mutex::new(stream_task),
         })
     }
 
@@ -1368,6 +1566,8 @@ impl DbReader {
     /// }
     /// ```
     pub async fn close(&self) -> Result<(), crate::Error> {
+        // Dropping the handle aborts the WAL stream task.
+        drop(self.stream_task.lock().take());
         self.task_executor
             .shutdown_task(DB_READER_TASK_NAME)
             .await
@@ -3348,6 +3548,7 @@ mod tests {
             status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
+            replay_lock: tokio::sync::Mutex::new(()),
             recorder,
         };
 
@@ -3435,6 +3636,7 @@ mod tests {
             status_manager,
             segment_extractor: None,
             rand: test_provider.rand.clone(),
+            replay_lock: tokio::sync::Mutex::new(()),
             recorder,
         }
     }

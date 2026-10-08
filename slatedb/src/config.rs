@@ -1179,6 +1179,27 @@ pub struct DbReaderOptions {
     /// Defaults to unbounded retries.
     #[serde(default)]
     pub object_store_max_retries: Option<u32>,
+
+    /// How the reader finds new rows in the WAL. Defaults to [`WalFollowMode::Poll`].
+    #[serde(default)]
+    pub wal_follow: WalFollowMode,
+}
+
+/// How a [`crate::DbReader`] finds new rows in the WAL.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub enum WalFollowMode {
+    /// At each `manifest_poll_interval`, the reader asks the WAL for its last file and reads
+    /// the new files.
+    #[default]
+    Poll,
+    /// The reader holds one WAL iterator with no end and applies new rows when the iterator
+    /// returns them. The reader still loads new manifests at each `manifest_poll_interval`,
+    /// but it does not ask the WAL for its last file. If the iterator reports that the WAL was
+    /// truncated, the reader loads the latest manifest at once and starts a new iterator.
+    ///
+    /// A reader in [`crate::DbReaderMode::Checkpoint`] mode, or with `skip_wal_replay`, does
+    /// not follow the WAL and ignores this value.
+    Stream,
 }
 
 impl Default for DbReaderOptions {
@@ -1191,6 +1212,7 @@ impl Default for DbReaderOptions {
             skip_wal_replay: false,
             metric_level: None,
             object_store_max_retries: None,
+            wal_follow: WalFollowMode::Poll,
         }
     }
 }

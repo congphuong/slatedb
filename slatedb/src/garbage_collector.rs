@@ -50,7 +50,7 @@ mod detach_gc;
 mod filter;
 mod manifest_gc;
 pub mod stats;
-mod wal_gc;
+pub(crate) mod wal_gc;
 
 use crate::wal::WalGc;
 pub(crate) use filter::retain_allowed_by_gc_filter;

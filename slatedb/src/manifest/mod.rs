@@ -425,6 +425,12 @@ pub(crate) struct ManifestCore {
     /// no extractor is configured.
     pub segment_extractor_name: Option<String>,
 
+    /// Name of the WAL implementation that holds the WAL of this database (see
+    /// [`crate::wal::WriterInit::wal_name`]). `None` means the native SlateDB WAL.
+    /// Persisted so that a writer or reader with a different WAL implementation
+    /// refuses to open the database.
+    pub wal_name: Option<String>,
+
     /// The next WAL SST ID to be assigned when creating a new WAL SST. The manifest FlatBuffer
     /// contains `wal_id_last_seen`, which is always one less than this value.
     pub next_wal_sst_id: u64,
@@ -468,6 +474,7 @@ impl ManifestCore {
             tree: Arc::new(LsmTreeState::default()),
             segments: vec![],
             segment_extractor_name: None,
+            wal_name: None,
             next_wal_sst_id: 1,
             replay_after_wal_id: 0,
             last_l0_clock_tick: i64::MIN,
@@ -584,6 +591,28 @@ impl ManifestCore {
             }
         }
         Ok(())
+    }
+
+    /// Compares the name of the configured WAL implementation with the name
+    /// that the manifest records. The names must be equal. `None` is the
+    /// native SlateDB WAL. To change the WAL implementation of a database, use
+    /// [`crate::admin::Admin::set_wal_name`] while the WAL is empty.
+    pub(crate) fn validate_wal_name(&self, configured: Option<&str>) -> Result<(), SlateDBError> {
+        let persisted = self.wal_name.as_deref();
+        if persisted == configured {
+            return Ok(());
+        }
+        Err(SlateDBError::WalNameMismatch {
+            persisted: persisted.map(str::to_string),
+            configured: configured.map(str::to_string),
+        })
+    }
+
+    /// Returns true if the manifest records no WAL file after the replay point.
+    /// The caller must also make sure that the WAL implementation holds no rows
+    /// that the manifest does not record yet.
+    pub(crate) fn wal_range_is_empty(&self) -> bool {
+        self.replay_after_wal_id + 1 >= self.next_wal_sst_id
     }
 
     /// RFC-0024 open-time reconciliation. Compares the configured
@@ -942,6 +971,12 @@ impl VersionedManifest {
     /// `None` means the database was created without a segment extractor.
     pub fn segment_extractor_name(&self) -> Option<&str> {
         self.manifest.core.segment_extractor_name.as_deref()
+    }
+
+    /// Returns the name of the WAL implementation that this manifest records, or `None` for
+    /// the native SlateDB WAL. See [`crate::wal::WriterInit::wal_name`].
+    pub fn wal_name(&self) -> Option<&str> {
+        self.manifest.core.wal_name.as_deref()
     }
 
     /// Every SST view in this manifest, across the root tree and every
