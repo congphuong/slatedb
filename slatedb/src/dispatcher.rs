@@ -677,6 +677,11 @@ impl MessageHandlerExecutor {
         }
     }
 
+    /// Returns the clock that the executor uses for tickers.
+    pub(crate) fn clock(&self) -> Arc<dyn SystemClock> {
+        self.clock.clone()
+    }
+
     /// Sets a custom [FailPointRegistry] for the executor.
     ///
     /// ## Arguments
