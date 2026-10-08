@@ -372,6 +372,26 @@ pub trait WalAdmin: Send + Sync + 'static {
         wal_id_last_seen: u64,
     ) -> Result<bool, WalError>;
 
+    /// Returns the ID of the last WAL file that exists at `path`, given that the manifest
+    /// records the WAL up to `wal_id_last_seen`.
+    ///
+    /// The stored manifest can lag the WAL: an open writer does not update it after each WAL
+    /// flush. A clone of the latest state uses this to include WAL files that are durable but
+    /// not yet in the manifest. The default returns `wal_id_last_seen`, which keeps the clone
+    /// limited to the range the manifest records.
+    ///
+    /// ## Arguments
+    /// - `path`: The database path containing the WAL.
+    /// - `wal_id_last_seen`: The last WAL file ID that the manifest records.
+    ///
+    /// ## Returns
+    /// The last WAL file ID, which is at least `wal_id_last_seen`, or a [`WalError`] if the WAL
+    /// could not be inspected.
+    async fn wal_tail(&self, path: &Path, wal_id_last_seen: u64) -> Result<u64, WalError> {
+        let _ = path;
+        Ok(wal_id_last_seen)
+    }
+
     /// Given a source path and manifest, copy the referenced WAL to a destination path and return
     /// a replay range. This call must be idempotent (TODO: clarify)
     ///

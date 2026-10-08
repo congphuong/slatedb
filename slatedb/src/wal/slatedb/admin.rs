@@ -135,6 +135,21 @@ impl WalAdmin for SlateDbWalAdmin {
         }
     }
 
+    async fn wal_tail(&self, path: &Path, wal_id_last_seen: u64) -> Result<u64, WalError> {
+        // WAL file IDs are consecutive, so the tail is the last ID before the first
+        // missing one. Fences count: a writer fences by writing an empty WAL file.
+        let path_resolver = PathResolver::from_root(path.clone());
+        let mut last = wal_id_last_seen;
+        loop {
+            let next = path_resolver.wal_sst_path(&WalFileId::from(last + 1));
+            match self.object_store.head(&next).await {
+                Ok(_) => last += 1,
+                Err(object_store::Error::NotFound { .. }) => return Ok(last),
+                Err(err) => return Err(WalError::Unavailable(Arc::new(err))),
+            }
+        }
+    }
+
     async fn clone_wal(
         &self,
         from_path: &Path,
