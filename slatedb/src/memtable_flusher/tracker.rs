@@ -912,6 +912,7 @@ mod tests {
                 &Handle::current(),
                 &executor,
                 &closed_result,
+                None,
             )
             .unwrap();
         executor.monitor_on(&Handle::current()).unwrap();
