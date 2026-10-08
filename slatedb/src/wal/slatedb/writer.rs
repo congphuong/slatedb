@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use self::stats::WalBufferStats;
-use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, MessageTickerDef};
+use crate::dispatcher::{MessageHandler, MessageHandlerExecutor, Notifier};
 use crate::error::SlateDBError;
 use crate::types::RowEntry;
 use crate::utils::SafeSender;
@@ -13,10 +13,15 @@ use crate::utils::{format_bytes_si, WatchableOnceCellReader};
 use crate::wal;
 use crate::wal::{WalError, WalEvent, WalFlushResult, WalStatus, WalWriter};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use futures::{stream::BoxStream, FutureExt, StreamExt};
 use log::{error, trace, warn};
+use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
-use tokio::{runtime::Handle, sync::oneshot};
+use tokio::{
+    runtime::Handle,
+    sync::{oneshot, Notify},
+};
 use tracing::instrument;
 
 use super::store::WalTableStore;
@@ -32,7 +37,9 @@ pub(crate) const WAL_BUFFER_TASK_NAME: &str = "wal_writer";
 /// By default, it offers a best-effort durability guarantee based on:
 ///
 /// - `max_wal_size`: Flushes when `max_wal_size` bytes is exceeded
-/// - `max_flush_interval`: Flushes after `max_flush_interval` elapses, if set
+/// - `max_flush_interval`: Flushes after `max_flush_interval` elapses, if set. The flush
+///   timer only runs while the current WAL holds entries, so an idle writer does not
+///   wake up on this interval.
 /// - `max_wal_flushes_before_l0_flush`: Requests a memtable flush when this many WAL files have
 ///   been flushed since the latest memtable replay point
 ///
@@ -60,6 +67,9 @@ pub(crate) struct SlateDbWalWriter {
     last_flush_requested_epoch: AtomicU64,
     /// task executor for the background worker.
     task_executor: Arc<MessageHandlerExecutor>,
+    /// Raised when the current WAL gets its first entry. It starts the flush
+    /// timer of the background worker. See [`WalFlushTimer`].
+    flush_timer: Arc<Notify>,
 }
 
 struct SlateDbWalWriterInner {
@@ -133,8 +143,11 @@ impl SlateDbWalWriter {
         };
         let inner = Arc::new(parking_lot::RwLock::new(inner));
         let stats = Arc::new(WalBufferStats::new(recorder));
+        let flush_timer = Arc::new(Notify::new());
         let wal_flush_handler = WalFlushHandler {
             max_flush_interval,
+            flush_timer: flush_timer.clone(),
+            clock: task_executor.clock(),
             inner: inner.clone(),
             table_store: table_store.clone(),
             stats: stats.clone(),
@@ -154,6 +167,7 @@ impl SlateDbWalWriter {
             max_wal_flushes_before_l0_flush,
             last_flush_requested_epoch: AtomicU64::new(0),
             task_executor,
+            flush_timer,
         })
     }
 
@@ -210,7 +224,15 @@ impl WalWriter for SlateDbWalWriter {
 
     /// Append row entries to the current WAL. Returns a watcher for durability notification.
     async fn append(&mut self, entries: &[RowEntry]) -> Result<(), WalError> {
-        self.inner.write().append(entries)?;
+        let was_empty = {
+            let mut inner = self.inner.write();
+            let was_empty = inner.current_wal.is_empty();
+            inner.append(entries)?;
+            was_empty && !inner.current_wal.is_empty()
+        };
+        if was_empty {
+            self.flush_timer.notify_one();
+        }
         self.maybe_trigger_flush()?;
         Ok(())
     }
@@ -479,6 +501,9 @@ impl Debug for WalFlushWork {
 
 struct WalFlushHandler {
     max_flush_interval: Option<Duration>,
+    /// See [`SlateDbWalWriter::flush_timer`].
+    flush_timer: Arc<Notify>,
+    clock: Arc<dyn SystemClock>,
     inner: Arc<parking_lot::RwLock<SlateDbWalWriterInner>>,
     table_store: Arc<WalTableStore>,
     stats: Arc<WalBufferStats>,
@@ -548,14 +573,16 @@ impl WalFlushHandler {
 
 #[async_trait]
 impl MessageHandler<WalFlushWork> for WalFlushHandler {
-    fn tickers(&mut self) -> Vec<MessageTickerDef<WalFlushWork>> {
-        if let Some(max_flush_interval) = self.max_flush_interval {
-            return vec![MessageTickerDef::new(
-                max_flush_interval,
-                Box::new(|| WalFlushWork::Flush { result_tx: None }),
-            )];
+    fn notifiers(&mut self) -> Vec<Box<dyn Notifier<WalFlushWork>>> {
+        match self.max_flush_interval {
+            Some(interval) => vec![Box::new(WalFlushTimer {
+                started: self.flush_timer.clone(),
+                anchor: self.clock.now(),
+                clock: self.clock.clone(),
+                interval,
+            })],
+            None => vec![],
         }
-        vec![]
     }
 
     async fn handle(&mut self, message: WalFlushWork) -> Result<(), SlateDBError> {
@@ -609,6 +636,53 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
             }
         }
         Ok(())
+    }
+}
+
+/// Flushes the WAL on `max_flush_interval` ticks, but only while the current
+/// WAL holds entries.
+///
+/// A plain ticker wakes the flush task every interval, also when nothing was
+/// written. With a short interval (for example 10ms) and many databases in one
+/// process, the idle wake-ups use real CPU. This timer waits until the writer
+/// appends to an empty WAL. It then waits for the next tick and flushes.
+///
+/// The ticks stay on the schedule of a ticker that started with the task:
+/// `anchor`, `anchor + interval`, `anchor + 2 * interval`, and so on. A write
+/// waits for the same tick as with a ticker, so the flush latency and the
+/// batching of writes into one WAL do not change.
+struct WalFlushTimer {
+    started: Arc<Notify>,
+    clock: Arc<dyn SystemClock>,
+    interval: Duration,
+    /// The time of the first tick of the schedule.
+    anchor: DateTime<Utc>,
+}
+
+impl WalFlushTimer {
+    /// Returns how long to wait from `now` until the next tick after `now`.
+    ///
+    /// A write at the exact time of a tick waits for the next tick. A ticker
+    /// does the same when its tick runs before the write: the tick at
+    /// `anchor` always runs before any write.
+    fn until_next_tick(&self, now: DateTime<Utc>) -> Duration {
+        let interval = self.interval.as_nanos().max(1);
+        let elapsed = now
+            .signed_duration_since(self.anchor)
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .as_nanos();
+        Duration::from_nanos((interval - elapsed % interval) as u64)
+    }
+}
+
+#[async_trait]
+impl Notifier<WalFlushWork> for WalFlushTimer {
+    async fn notify(&mut self) -> WalFlushWork {
+        self.started.notified().await;
+        let wait = self.until_next_tick(self.clock.now());
+        self.clock.sleep(wait).await;
+        WalFlushWork::Flush { result_tx: None }
     }
 }
 
@@ -692,6 +766,59 @@ mod tests {
             create_ts,
             None,
         )
+    }
+
+    fn flush_timer(interval: Duration) -> (WalFlushTimer, Arc<Notify>, Arc<dyn SystemClock>) {
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let started = Arc::new(Notify::new());
+        let timer = WalFlushTimer {
+            started: started.clone(),
+            anchor: clock.now(),
+            clock: clock.clone(),
+            interval,
+        };
+        (timer, started, clock)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_not_fire_flush_timer_while_wal_is_empty() {
+        let (mut timer, _started, _clock) = flush_timer(Duration::from_millis(10));
+
+        // Without an append, the timer does not fire, however long it waits.
+        let idle = tokio::time::timeout(Duration::from_secs(60), timer.notify()).await;
+
+        assert!(idle.is_err(), "the flush timer fired with an empty WAL");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_flush_on_the_next_tick_of_the_ticker_schedule() {
+        let (mut timer, started, clock) = flush_timer(Duration::from_millis(10));
+        // 60.003s after the anchor: 3ms after a tick of the schedule.
+        tokio::time::sleep(Duration::from_millis(60_003)).await;
+        let appended_at = clock.now();
+
+        started.notify_one();
+        let work = timer.notify().await;
+
+        assert!(matches!(work, WalFlushWork::Flush { result_tx: None }));
+        assert_eq!(
+            clock.now().signed_duration_since(appended_at),
+            chrono::Duration::milliseconds(7)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn should_wait_a_full_interval_for_an_append_at_a_tick() {
+        let (mut timer, started, clock) = flush_timer(Duration::from_millis(10));
+        let appended_at = clock.now();
+
+        started.notify_one();
+        timer.notify().await;
+
+        assert_eq!(
+            clock.now().signed_duration_since(appended_at),
+            chrono::Duration::milliseconds(10)
+        );
     }
 
     #[test]
