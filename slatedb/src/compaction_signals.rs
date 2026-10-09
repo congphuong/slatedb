@@ -95,127 +95,15 @@ mod tests {
     use crate::config::{
         CompactionWorkerOptions, CompactorOptions, FlushOptions, FlushType, Settings,
     };
+    use crate::test_utils::CountingObjectStore;
     use crate::Db;
-    use async_trait::async_trait;
-    use futures::stream::BoxStream;
-    use object_store::memory::InMemory;
     use object_store::path::Path;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    };
-    use std::fmt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// A poll interval that no test reaches. Any progress a test sees must
     /// come from a signal, or from the first tick that each ticker fires at
     /// startup.
     const NEVER: Duration = Duration::from_secs(3600);
-
-    /// Counts every request that reaches the inner store.
-    #[derive(Debug)]
-    struct CountingObjectStore {
-        inner: Arc<dyn ObjectStore>,
-        requests: AtomicUsize,
-    }
-
-    impl CountingObjectStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: Arc::new(InMemory::new()),
-                requests: AtomicUsize::new(0),
-            })
-        }
-
-        fn requests(&self) -> usize {
-            self.requests.load(Ordering::SeqCst)
-        }
-
-        fn count(&self) {
-            self.requests.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    impl fmt::Display for CountingObjectStore {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "CountingObjectStore({})", self.inner)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for CountingObjectStore {
-        async fn get_opts(
-            &self,
-            location: &Path,
-            options: GetOptions,
-        ) -> object_store::Result<GetResult> {
-            self.count();
-            self.inner.get_opts(location, options).await
-        }
-
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> object_store::Result<PutResult> {
-            self.count();
-            self.inner.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> object_store::Result<Box<dyn MultipartUpload>> {
-            self.count();
-            self.inner.put_multipart_opts(location, opts).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, object_store::Result<Path>>,
-        ) -> BoxStream<'static, object_store::Result<Path>> {
-            self.count();
-            self.inner.delete_stream(locations)
-        }
-
-        fn list(
-            &self,
-            prefix: Option<&Path>,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.count();
-            self.inner.list(prefix)
-        }
-
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
-            self.count();
-            self.inner.list_with_offset(prefix, offset)
-        }
-
-        async fn list_with_delimiter(
-            &self,
-            prefix: Option<&Path>,
-        ) -> object_store::Result<ListResult> {
-            self.count();
-            self.inner.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(
-            &self,
-            from: &Path,
-            to: &Path,
-            options: CopyOptions,
-        ) -> object_store::Result<()> {
-            self.count();
-            self.inner.copy_opts(from, to, options).await
-        }
-    }
 
     /// Settings with an embedded compactor and worker whose polls never fire
     /// after startup, and an L0 limit of `l0_max_ssts`.

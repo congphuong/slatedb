@@ -1664,6 +1664,21 @@ pub struct GarbageCollectorOptions {
     /// None means garbage collection is disabled for the compactions directory.
     pub compactions_options: Option<GarbageCollectorDirectoryOptions>,
 
+    /// The longest time a garbage collector that runs inside a database
+    /// process may skip its passes while the database does not change.
+    ///
+    /// When set, such a collector reads the database's in-memory manifest
+    /// before each pass. It skips the pass if the manifest is the same as at
+    /// its previous pass, no checkpoint expired since then, and the previous
+    /// pass was not too early to delete objects younger than `min_age`. A pass
+    /// still runs at least once in this duration. An idle database then sends
+    /// almost no garbage collection requests.
+    ///
+    /// None (the default) runs every pass. A standalone collector always runs
+    /// every pass, because it has no in-memory manifest to read.
+    #[serde(default)]
+    pub idle_skip_max: Option<Duration>,
+
     /// Garbage collection options for detaching a clone from its parent database(s).
     ///
     /// When a clone no longer references any of a parent's SSTs (in its current
@@ -1793,6 +1808,7 @@ impl Default for GarbageCollectorOptions {
             compacted_options: Some(GarbageCollectorDirectoryOptions::default()),
             compactions_options: Some(GarbageCollectorDirectoryOptions::default()),
             detach_options: Some(GarbageCollectorScheduleOptions::default()),
+            idle_skip_max: None,
             metric_level: None,
             boundary_files_enabled: true,
             object_store_max_retries: None,

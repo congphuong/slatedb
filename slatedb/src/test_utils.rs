@@ -1958,3 +1958,101 @@ impl ObjectStore for RecordingObjectStore {
         self.inner.copy_opts(from, to, options).await
     }
 }
+
+/// Counts every request that reaches the inner store.
+#[derive(Debug)]
+pub(crate) struct CountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    requests: AtomicUsize,
+}
+
+impl CountingObjectStore {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(object_store::memory::InMemory::new()),
+            requests: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    fn count(&self) {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl fmt::Display for CountingObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CountingObjectStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.count();
+        self.inner.get_opts(location, options).await
+    }
+
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: OS_PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.count();
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.count();
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.count();
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.count();
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.count();
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.count();
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.count();
+        self.inner.copy_opts(from, to, options).await
+    }
+}
