@@ -636,6 +636,13 @@ impl ManifestWriterHandler {
             checkpoint_results.push(CheckpointCreateResult { id, manifest_id });
         }
         self.manifest.update(dirty).await?;
+        if !checkpoint_results.is_empty() {
+            // Show the new checkpoints in the in-memory manifest and in the
+            // database status at once. A garbage collector in this process
+            // reads the status to know when a checkpoint expires.
+            let written = self.manifest.prepare_dirty()?;
+            self.merge_remote_manifest(written);
+        }
         Ok(checkpoint_results)
     }
 
