@@ -312,6 +312,93 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    /// Waits until `.compactions` holds a `Scheduled` compaction and returns it.
+    async fn wait_for_scheduled_compaction(
+        compactions_store: Arc<crate::compactions_store::CompactionsStore>,
+    ) -> crate::compactor_state::Compaction {
+        use crate::compactions_store::StoredCompactions;
+        use crate::compactor_state::CompactionStatus;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(stored) = StoredCompactions::try_load(compactions_store.clone())
+                .await
+                .unwrap()
+            {
+                let scheduled = stored
+                    .prepare_dirty()
+                    .unwrap()
+                    .value
+                    .iter_with_status(&[CompactionStatus::Scheduled])
+                    .next()
+                    .cloned();
+                if let Some(compaction) = scheduled {
+                    return compaction;
+                }
+            }
+            assert!(Instant::now() < deadline, "no compaction was scheduled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_reclaim_the_job_of_a_dead_worker_without_a_poll() {
+        use crate::compactions_store::{CompactionsStore, StoredCompactions};
+        use crate::compactor_state::{CompactionStatus, WorkerSpec};
+
+        let store = CountingObjectStore::new();
+        // A coordinator without a worker schedules an L0 compaction that nobody
+        // runs.
+        let mut settings = settings_without_polls(4);
+        if let Some(compactor) = settings.compactor_options.as_mut() {
+            compactor.worker = None;
+        }
+        let db = open_db(store.clone(), settings).await;
+        for i in 0..4 {
+            write_l0(&db, i).await;
+        }
+        let compactions_store = Arc::new(CompactionsStore::new(
+            &Path::from("/tmp/test_compaction_signals"),
+            store.clone(),
+        ));
+        let compaction = wait_for_scheduled_compaction(compactions_store.clone()).await;
+        db.close().await.unwrap();
+
+        // A worker claims the job and dies: the job stays `Running`, and its
+        // heartbeat is fresh when the database opens again.
+        let mut stored = StoredCompactions::try_load(compactions_store)
+            .await
+            .unwrap()
+            .expect("the compactions file exists");
+        let mut dirty = stored.prepare_dirty().unwrap();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        dirty.value.insert(
+            compaction
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("dead-worker".to_string(), now_ms))),
+        );
+        stored.update(dirty).await.unwrap();
+
+        // Open again with an embedded worker. L0 is at the limit, and the job
+        // of the dead worker blocks every other L0 compaction. The coordinator
+        // must reclaim the job when its heartbeat times out, without a poll.
+        let mut settings = settings_without_polls(4);
+        if let Some(compactor) = settings.compactor_options.as_mut() {
+            compactor.worker_heartbeat_timeout = Duration::from_secs(1);
+        }
+        let db = open_db(store, settings).await;
+        let flush = tokio::time::timeout(Duration::from_secs(15), write_l0(&db, 4)).await;
+
+        assert!(
+            flush.is_ok(),
+            "a flush stalled behind the job of a dead worker did not resume [state={:?}]",
+            l0_and_sorted_runs(&db)
+        );
+        db.close().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn should_send_no_requests_when_idle_after_a_compaction() {
         let store = CountingObjectStore::new();
