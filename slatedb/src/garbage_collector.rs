@@ -32,12 +32,13 @@ use compacted_gc::CompactedGcTask;
 use compactions_gc::CompactionsGcTask;
 use detach_gc::DetachGcTask;
 use futures::stream::BoxStream;
-use log::{error, info};
+use log::{debug, error, info};
 use manifest_gc::ManifestGcTask;
 use object_store::ObjectStore;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
 use slatedb_txn_obj::{DirtyObject, SimpleTransactionalObject, TransactionalObject};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -70,7 +71,7 @@ trait GcTask {
     async fn collect(&self, now: DateTime<Utc>) -> Result<(), SlateDBError>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum GcMessage {
     Wal,
     WalFence,
@@ -109,6 +110,79 @@ pub struct GarbageCollector {
     compacted_gc_task: Option<CompactedGcTask>,
     compactions_gc_task: Option<CompactionsGcTask>,
     detach_gc_task: Option<DetachGcTask>,
+    /// Set when the collector runs inside a database process and
+    /// [`GarbageCollectorOptions::idle_skip_max`] is set.
+    idle_skip: Option<IdleSkip>,
+}
+
+/// Decides whether a pass can be skipped because the database did not change
+/// since the previous pass of the same task. See
+/// [`GarbageCollectorOptions::idle_skip_max`].
+#[derive(Clone)]
+struct IdleSkip {
+    status: tokio::sync::watch::Receiver<crate::db_status::DbStatus>,
+    max_skip: Duration,
+    /// The largest `min_age` of the enabled tasks. A pass that ran less than
+    /// this after a change could not delete the youngest garbage yet.
+    settle: Duration,
+    last: HashMap<GcMessage, PassMark>,
+}
+
+/// What a task saw at its previous pass.
+#[derive(Clone)]
+struct PassMark {
+    manifest_id: u64,
+    at: DateTime<Utc>,
+    /// When a pass first saw the current manifest.
+    changed_at: DateTime<Utc>,
+    expired: HashSet<uuid::Uuid>,
+}
+
+impl IdleSkip {
+    /// Returns true if the pass for `task` can be skipped at `now`. Records
+    /// the pass otherwise.
+    fn skip(&mut self, task: GcMessage, now: DateTime<Utc>) -> bool {
+        let (manifest_id, expired) = {
+            let status = self.status.borrow();
+            let manifest = &status.current_manifest;
+            let expired: HashSet<uuid::Uuid> = manifest
+                .manifest
+                .core
+                .checkpoints
+                .iter()
+                .filter(|c| c.expire_time.is_some_and(|t| t <= now))
+                .map(|c| c.id)
+                .collect();
+            (manifest.id, expired)
+        };
+        let elapsed = |since: DateTime<Utc>| (now - since).to_std().unwrap_or(Duration::ZERO);
+        if let Some(mark) = self.last.get(&task) {
+            let changed = manifest_id != mark.manifest_id;
+            let settling = (mark.at - mark.changed_at)
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                < self.settle;
+            let newly_expired = !expired.is_subset(&mark.expired);
+            let overdue = elapsed(mark.at) >= self.max_skip;
+            if !(changed || settling || newly_expired || overdue) {
+                return true;
+            }
+        }
+        let changed_at = match self.last.get(&task) {
+            Some(mark) if mark.manifest_id == manifest_id => mark.changed_at,
+            _ => now,
+        };
+        self.last.insert(
+            task,
+            PassMark {
+                manifest_id,
+                at: now,
+                changed_at,
+                expired,
+            },
+        );
+        false
+    }
 }
 
 #[async_trait]
@@ -157,6 +231,15 @@ impl MessageHandler<GcMessage> for GarbageCollector {
     }
 
     async fn handle(&mut self, message: GcMessage) -> Result<(), SlateDBError> {
+        let now = self.system_clock.now();
+        if let Some(idle) = self.idle_skip.as_mut() {
+            if idle.skip(message, now) {
+                debug!(
+                    "skipping garbage collection pass of an unchanged database [task={message:?}]"
+                );
+                return Ok(());
+            }
+        }
         match message {
             GcMessage::Manifest => {
                 let task = self
@@ -331,6 +414,7 @@ impl GarbageCollector {
             compacted_gc_task,
             compactions_gc_task,
             detach_gc_task,
+            idle_skip: None,
         }
     }
 
@@ -405,6 +489,38 @@ impl GarbageCollector {
         }
 
         self.stats.gc_count.increment(1);
+    }
+
+    /// Lets the collector skip passes while the database of this process
+    /// does not change. Has no effect unless
+    /// [`GarbageCollectorOptions::idle_skip_max`] is set.
+    pub(crate) fn with_db_status(
+        mut self,
+        status: tokio::sync::watch::Receiver<crate::db_status::DbStatus>,
+    ) -> Self {
+        if let Some(max_skip) = self.options.idle_skip_max {
+            let settle = [
+                self.options.manifest_options,
+                self.options.wal_options,
+                self.options.wal_fence_options,
+                self.options.compacted_options,
+                self.options.compactions_options,
+            ]
+            .into_iter()
+            .flatten()
+            // A dry run deletes nothing, so it has nothing to wait for.
+            .filter(|o| !o.dry_run)
+            .map(|o| o.min_age)
+            .max()
+            .unwrap_or(Duration::ZERO);
+            self.idle_skip = Some(IdleSkip {
+                status,
+                max_skip,
+                settle,
+                last: HashMap::new(),
+            });
+        }
+        self
     }
 
     #[instrument(level = "debug", skip_all, fields(resource = task.resource()))]
@@ -1193,6 +1309,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -1264,6 +1381,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
@@ -1334,6 +1452,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: None,
             wal_fence_options: Some(GarbageCollectorDirectoryOptions {
@@ -1413,6 +1532,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -1891,6 +2011,7 @@ mod tests {
         }
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: None,
@@ -1971,6 +2092,7 @@ mod tests {
         // Build a GC with standard options (1h min_age)
         let recorder = MetricsRecorderHelper::noop();
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: None,
@@ -2050,6 +2172,7 @@ mod tests {
 
         let recorder = MetricsRecorderHelper::noop();
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2103,6 +2226,7 @@ mod tests {
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2156,6 +2280,7 @@ mod tests {
         let recorder = MetricsRecorderHelper::noop();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
                 interval: Some(Duration::from_secs(1)),
@@ -2505,6 +2630,7 @@ mod tests {
             dry_run: false,
         };
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: Some(options),
             wal_options: Some(options),
             wal_fence_options: Some(options),
@@ -2604,6 +2730,7 @@ mod tests {
         .unwrap();
 
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: None,
             wal_options: Some(GarbageCollectorDirectoryOptions {
                 min_age: Duration::from_secs(3600),
@@ -2742,6 +2869,7 @@ mod tests {
             dry_run: true,
         };
         let gc_opts = GarbageCollectorOptions {
+            idle_skip_max: None,
             manifest_options: Some(dry_run_options),
             wal_options: Some(dry_run_options),
             wal_fence_options: Some(dry_run_options),
@@ -2795,5 +2923,133 @@ mod tests {
             compactions_store.list_compactions(..).await.unwrap().len(),
             compaction_ids.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod idle_skip_tests {
+    use crate::config::{
+        CheckpointOptions, CheckpointScope, GarbageCollectorDirectoryOptions,
+        GarbageCollectorOptions, Settings,
+    };
+    use crate::manifest::store::{ManifestStore, StoredManifest};
+    use crate::test_utils::CountingObjectStore;
+    use crate::Db;
+    use object_store::path::Path;
+    use slatedb_common::clock::DefaultSystemClock;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    const PATH: &str = "/tmp/test_gc_idle_skip";
+
+    /// Every task runs every 50ms with no minimum age, so a pass that runs has
+    /// work to do at once.
+    fn settings(idle_skip_max: Option<Duration>) -> Settings {
+        let dir = Some(GarbageCollectorDirectoryOptions {
+            interval: Some(Duration::from_millis(50)),
+            min_age: Duration::ZERO,
+            dry_run: false,
+        });
+        Settings {
+            flush_interval: None,
+            manifest_poll_interval: Duration::from_secs(3600),
+            compactor_options: None,
+            garbage_collector_options: Some(GarbageCollectorOptions {
+                manifest_options: dir,
+                wal_options: dir,
+                compacted_options: dir,
+                compactions_options: dir,
+                idle_skip_max,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    async fn open(store: Arc<CountingObjectStore>, settings: Settings) -> Db {
+        Db::builder(PATH, store)
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// Requests sent in `window` after the first passes ran.
+    async fn idle_requests(store: &CountingObjectStore, window: Duration) -> usize {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = store.requests();
+        tokio::time::sleep(window).await;
+        store.requests() - before
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_skip_passes_while_the_database_does_not_change() {
+        let window = Duration::from_secs(1);
+        let every_pass = CountingObjectStore::new();
+        let db = open(every_pass.clone(), settings(None)).await;
+        let without_skip = idle_requests(&every_pass, window).await;
+        db.close().await.unwrap();
+
+        let skipping = CountingObjectStore::new();
+        let db = open(skipping.clone(), settings(Some(Duration::from_secs(3600)))).await;
+        let with_skip = idle_requests(&skipping, window).await;
+        db.close().await.unwrap();
+
+        assert!(
+            without_skip > 0,
+            "the collector sent no requests without skipping; the test measures nothing"
+        );
+        assert_eq!(
+            with_skip, 0,
+            "an idle database sent {with_skip} garbage collection requests \
+             ({without_skip} without skipping)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_remove_a_checkpoint_that_expires_while_idle() {
+        let store = CountingObjectStore::new();
+        let db = open(store.clone(), settings(Some(Duration::from_secs(3600)))).await;
+        let checkpoint = db
+            .create_checkpoint(
+                CheckpointScope::Durable,
+                &CheckpointOptions {
+                    lifetime: Some(Duration::from_secs(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The passes after the checkpoint see a changed manifest, then the
+        // manifest stays the same. The checkpoint expires later: only its
+        // expiry makes a pass run again.
+        let manifest_store = Arc::new(ManifestStore::new(&Path::from(PATH), store.clone()));
+        let present = || async {
+            StoredManifest::load(manifest_store.clone(), Arc::new(DefaultSystemClock::new()))
+                .await
+                .unwrap()
+                .manifest()
+                .core
+                .checkpoints
+                .iter()
+                .any(|c| c.id == checkpoint.id)
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            present().await,
+            "the checkpoint went away before it expired"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !present().await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the collector did not remove the expired checkpoint"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        db.close().await.unwrap();
     }
 }

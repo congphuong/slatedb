@@ -919,7 +919,8 @@ impl<P: Into<Path>> DbBuilder<P> {
                     manifest_store.clone(),
                     compactions_store.clone(),
                     gc_object_store,
-                );
+                )
+                .with_db_status(inner.status_manager.subscribe());
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = async_channel::unbounded();
             let gc_handle = self.gc_runtime.as_ref().unwrap_or(&tokio_handle);

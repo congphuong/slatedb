@@ -282,6 +282,7 @@ mod tests {
                 self.object_store.clone(),
             ));
             let gc_opts = GarbageCollectorOptions {
+                idle_skip_max: None,
                 manifest_options: None,
                 wal_options: Some(GarbageCollectorDirectoryOptions {
                     min_age: Duration::ZERO,
