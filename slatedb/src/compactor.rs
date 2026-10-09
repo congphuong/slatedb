@@ -595,6 +595,14 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
                 // new submissions. We can avoid an otherwise idle object-store refresh.
                 if self.state().active_compactions().next().is_some() {
                     self.state_writer.load_compactions().await?;
+                    // Reclaim jobs of dead workers here too, not only on the
+                    // manifest poll. A job of a dead worker blocks every L0
+                    // compaction of its segment. If the writer is stalled at
+                    // the L0 limit, nothing else wakes the coordinator, so with
+                    // a long poll interval the writer waits for the poll. This
+                    // tick runs only while jobs are active, and it already
+                    // reads `.compactions`.
+                    self.reclaim_stale_workers().await?;
                     self.update_distributed_compaction_metrics();
                     if self.commit_compacted_entries().await? {
                         // The commit removed sources from the tree. Schedule the
