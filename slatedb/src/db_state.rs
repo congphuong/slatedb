@@ -271,7 +271,16 @@ impl SsTableView {
         self.sst.estimate_size()
     }
 
-    pub(crate) fn estimate_visible_size(&self) -> u64 {
+    /// Returns an estimate of the bytes of the underlying SST that this view
+    /// can see.
+    ///
+    /// A projected view (for example a view of a clone that keeps only part of
+    /// the source key space) sees only part of the SST. [`Self::estimate_size`]
+    /// counts the whole SST, so a database with projected views looks larger
+    /// than it is. This method scales the SST size by the visible part of its
+    /// key range, so the sum over all views of a database estimates the data
+    /// of that database alone.
+    pub fn estimate_visible_size(&self) -> u64 {
         const MIN_ESTIMATED_SIZE_BYTES: f64 = 1.0;
 
         let raw_size = self.sst.estimate_size();
@@ -608,7 +617,9 @@ impl SortedRun {
         self.sst_views.iter().map(|sst| sst.estimate_size()).sum()
     }
 
-    pub(crate) fn estimate_visible_size(&self) -> u64 {
+    /// Estimate the bytes that the views of this sorted run can see. See
+    /// [`SsTableView::estimate_visible_size`].
+    pub fn estimate_visible_size(&self) -> u64 {
         self.sst_views
             .iter()
             .map(|sst| sst.estimate_visible_size())
