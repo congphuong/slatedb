@@ -267,7 +267,10 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     &CheckpointOptions {
                         lifetime: None,
                         source: Some(external_db.source_checkpoint_id),
-                        name: None,
+                        // The clone path names the checkpoint. A cleanup tool
+                        // can then find the clone that owns a final checkpoint
+                        // from the side of the source database.
+                        name: Some(clone_path.to_string()),
                     },
                 )
                 .await?;
