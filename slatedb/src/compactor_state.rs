@@ -1037,6 +1037,8 @@ impl CompactorState {
             segment_extractor_name: remote_manifest.value.core.segment_extractor_name.clone(),
             // The writer owns the WAL configuration.
             wal_name: remote_manifest.value.core.wal_name.clone(),
+            // `Admin::close_for_writes` owns this flag. Keep the stored value.
+            closed: remote_manifest.value.core.closed,
             next_wal_sst_id: remote_manifest.value.core.next_wal_sst_id,
             replay_after_wal_id: remote_manifest.value.core.replay_after_wal_id,
             last_l0_clock_tick: remote_manifest.value.core.last_l0_clock_tick,
