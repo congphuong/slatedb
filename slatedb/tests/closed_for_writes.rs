@@ -35,7 +35,10 @@ async fn closed_database_refuses_writers_until_reopened() {
     db.close().await.expect("close failed");
 
     let admin = admin(&path, &store);
-    admin.close_for_writes().await.expect("close for writes failed");
+    admin
+        .close_for_writes()
+        .await
+        .expect("close for writes failed");
     // Idempotent.
     admin.close_for_writes().await.expect("second close failed");
     assert!(closed_flag(&path, &store).await);
@@ -47,7 +50,10 @@ async fn closed_database_refuses_writers_until_reopened() {
     assert_eq!(err.kind(), ErrorKind::Closed(CloseReason::Fenced));
 
     admin.reopen_for_writes().await.expect("reopen failed");
-    admin.reopen_for_writes().await.expect("second reopen failed");
+    admin
+        .reopen_for_writes()
+        .await
+        .expect("second reopen failed");
     assert!(!closed_flag(&path, &store).await);
     let db = open(&path, &store).await.expect("reopened database opens");
     assert_eq!(
