@@ -104,6 +104,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
@@ -200,6 +201,7 @@ pub struct DbBuilder<P: Into<Path>> {
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     wal_writer_init: Option<Box<dyn wal::WriterInit>>,
+    boundary_trust_window: Option<Duration>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -232,6 +234,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
             segment_extractor: None,
             wal_writer_init: None,
+            boundary_trust_window: None,
         }
     }
 
@@ -320,6 +323,23 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// scheduling operations such as compaction and garbage collection.
     pub fn with_system_clock(mut self, clock: Arc<dyn SystemClock>) -> Self {
         self.system_clock = Some(clock);
+        self
+    }
+
+    /// Lets a latest read of the manifest or the compactions file skip the GC boundary GET.
+    ///
+    /// Each latest read of these files GETs the next version ID. If that GET returns 404, the
+    /// read also GETs the GC boundary file, because GC can delete old versions. With this
+    /// option, the read skips the boundary GET when this database confirmed the same version
+    /// less than `window` ago. The writer, the embedded compactor and the embedded garbage
+    /// collector share these reads.
+    ///
+    /// The window must be shorter than the `min_age` of every garbage collector that deletes
+    /// manifest or compactions files of this database, minus the largest clock skew between
+    /// the garbage collector hosts and the object store. Unset (the default) checks the
+    /// boundary on every latest read.
+    pub fn with_boundary_trust_window(mut self, window: Duration) -> Self {
+        self.boundary_trust_window = Some(window);
         self
     }
 
@@ -592,13 +612,18 @@ impl<P: Into<Path>> DbBuilder<P> {
         };
 
         // Setup the manifest store and load latest manifest
-        let manifest_store = Arc::new(ManifestStore::new(
+        let boundary_trust = self
+            .boundary_trust_window
+            .map(|window| (window, system_clock.clone()));
+        let manifest_store = Arc::new(ManifestStore::new_with_boundary_trust(
             &path,
             retrying_main_object_store.clone(),
+            boundary_trust.clone(),
         ));
-        let compactions_store = Arc::new(CompactionsStore::new(
+        let compactions_store = Arc::new(CompactionsStore::new_with_boundary_trust(
             &path,
             retrying_main_object_store.clone(),
+            boundary_trust,
         ));
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
@@ -1837,6 +1862,7 @@ pub struct DbReaderBuilder<P: Into<Path>> {
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
+    boundary_trust_window: Option<Duration>,
 }
 
 impl<P: Into<Path>> DbReaderBuilder<P> {
@@ -1857,7 +1883,16 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             system_clock: Arc::new(DefaultSystemClock::default()),
             rand: Arc::new(DbRand::default()),
             metrics_recorder: Arc::new(NoopMetricsRecorder::new()),
+            boundary_trust_window: None,
         }
+    }
+
+    /// Lets a latest read of the manifest skip the GC boundary GET when this reader confirmed
+    /// the same version less than `window` ago. The same rules as
+    /// [`DbBuilder::with_boundary_trust_window`] apply.
+    pub fn with_boundary_trust_window(mut self, window: Duration) -> Self {
+        self.boundary_trust_window = Some(window);
+        self
     }
 
     /// Sets how the reader chooses and refreshes database state.
@@ -2038,7 +2073,12 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             .unwrap_or_else(|| retrying_object_store.clone());
 
         // Validate WAL object store configuration.
-        let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store.clone()));
+        let manifest_store = Arc::new(ManifestStore::new_with_boundary_trust(
+            &path,
+            retrying_object_store.clone(),
+            self.boundary_trust_window
+                .map(|window| (window, self.system_clock.clone())),
+        ));
         let latest_manifest =
             StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
                 .await?;

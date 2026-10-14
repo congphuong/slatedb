@@ -454,14 +454,27 @@ pub(crate) struct ManifestStore {
 
 impl ManifestStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> =
-            Arc::new(ObjectStoreSequencedStorageProtocol::<Manifest>::new(
-                root_path,
-                object_store,
-                "manifest",
-                "manifest",
-                Box::new(FlatBufferManifestCodec {}),
-            ));
+        Self::new_with_boundary_trust(root_path, object_store, None)
+    }
+
+    /// Creates a manifest store whose latest reads can skip the boundary GET. See
+    /// [`crate::DbBuilder::with_boundary_trust_window`].
+    pub(crate) fn new_with_boundary_trust(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        trust: Option<(Duration, Arc<dyn SystemClock>)>,
+    ) -> Self {
+        let mut protocol = ObjectStoreSequencedStorageProtocol::<Manifest>::new(
+            root_path,
+            object_store,
+            "manifest",
+            "manifest",
+            Box::new(FlatBufferManifestCodec {}),
+        );
+        if let Some((window, clock)) = trust {
+            protocol = protocol.with_boundary_trust_window(window, clock);
+        }
+        let inner: Arc<dyn SequencedStorageProtocol<Manifest>> = Arc::new(protocol);
         Self { inner }
     }
 
@@ -594,11 +607,11 @@ mod tests {
     use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
     use crate::manifest::ManifestCore;
     use crate::retrying_object_store::RetryingObjectStore;
-    use crate::test_utils::{bounded_sst_view, FlakyObjectStore};
+    use crate::test_utils::{bounded_sst_view, CountingObjectStore, FlakyObjectStore};
     use chrono::Timelike;
     use object_store::memory::InMemory;
     use object_store::path::Path;
-    use slatedb_common::clock::{DefaultSystemClock, SystemClock};
+    use slatedb_common::clock::{DefaultSystemClock, MockSystemClock, SystemClock};
     use slatedb_common::DbRand;
     use slatedb_txn_obj::object_store::ObjectStoreBoundaryObject;
     use slatedb_txn_obj::{BoundaryObject, MonotonicId, TransactionalObject};
@@ -702,6 +715,82 @@ mod tests {
             result,
             Err(SlateDBError::TransactionalObjectVersionExists)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_boundary_trust_window_skips_boundary_get_on_unchanged_refresh() {
+        let object_store = CountingObjectStore::new();
+        let clock = Arc::new(MockSystemClock::new());
+        let writer_ms = Arc::new(ManifestStore::new(&Path::from(ROOT), object_store.clone()));
+        let mut writer = StoredManifest::create_new_db(
+            writer_ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let reader_ms = Arc::new(ManifestStore::new_with_boundary_trust(
+            &Path::from(ROOT),
+            object_store.clone(),
+            Some((Duration::from_secs(60), clock.clone())),
+        ));
+        let boundary_gets = || object_store.gets_ending_with("manifest.boundary");
+
+        // A cold load checks the boundary once.
+        let before_load = boundary_gets();
+        let mut reader = StoredManifest::load(reader_ms, clock.clone())
+            .await
+            .unwrap();
+        let after_load = boundary_gets();
+        assert_eq!(before_load + 1, after_load);
+
+        // An unchanged manifest: each refresh GETs the next ID and gets 404, but does
+        // not GET the boundary.
+        for second in [10, 50, 100] {
+            clock.set(second * 1000);
+            reader.refresh().await.unwrap();
+        }
+        assert_eq!(after_load, boundary_gets());
+
+        // A new version is not confirmed yet, so the first read of it checks the
+        // boundary. The next refresh does not.
+        writer
+            .update(writer.prepare_dirty().unwrap())
+            .await
+            .unwrap();
+        let before = boundary_gets();
+        reader.refresh().await.unwrap();
+        assert_eq!(2, reader.id());
+        assert_eq!(before + 1, boundary_gets());
+        reader.refresh().await.unwrap();
+        assert_eq!(before + 1, boundary_gets());
+
+        // After an idle period as long as the window, the refresh checks again.
+        clock.set(160_000);
+        reader.refresh().await.unwrap();
+        assert_eq!(before + 2, boundary_gets());
+    }
+
+    #[tokio::test]
+    async fn test_without_boundary_trust_window_every_refresh_gets_boundary() {
+        let object_store = CountingObjectStore::new();
+        let ms = Arc::new(ManifestStore::new(&Path::from(ROOT), object_store.clone()));
+        let mut sm = StoredManifest::create_new_db(
+            ms,
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+        )
+        .await
+        .unwrap();
+        let before = object_store.gets_ending_with("manifest.boundary");
+
+        sm.refresh().await.unwrap();
+        sm.refresh().await.unwrap();
+
+        assert_eq!(
+            before + 2,
+            object_store.gets_ending_with("manifest.boundary")
+        );
     }
 
     #[tokio::test]

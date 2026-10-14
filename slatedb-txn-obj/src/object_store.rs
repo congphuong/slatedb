@@ -1,9 +1,11 @@
 use crate::TransactionalObjectError::CallbackError;
 use crate::{
-    BoundaryObject, MonotonicId, ObjectCodec, SequencedStorageProtocol, TransactionalObjectError,
+    try_read_latest_checked_default, write_checked_default, BoundaryObject, MonotonicId,
+    ObjectCodec, SequencedStorageProtocol, TransactionalObjectError,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use log::{debug, error, warn};
 use object_store::path::Path;
@@ -12,13 +14,70 @@ use object_store::{
     Error, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion,
 };
 use parking_lot::Mutex;
+use slatedb_common::clock::SystemClock;
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 use std::collections::Bound;
 use std::collections::Bound::Unbounded;
 use std::ops::RangeBounds;
 use std::sync::Arc;
+use std::time::Duration;
 
 const MAX_PROBES: usize = 4;
+
+/// Lets a latest read skip the boundary GET. See
+/// [`ObjectStoreSequencedStorageProtocol::with_boundary_trust_window`].
+struct BoundaryTrust {
+    window: Duration,
+    clock: Arc<dyn SystemClock>,
+    /// The last version that this instance confirmed as the latest version above the boundary,
+    /// and a time before the read or write that confirmed it. A successor of this version, if
+    /// one exists, was created after that time.
+    confirmed: Mutex<Option<(MonotonicId, DateTime<Utc>)>>,
+}
+
+impl BoundaryTrust {
+    /// Records that `id` was the latest version above the boundary at `at`.
+    fn confirm(&self, id: MonotonicId, at: DateTime<Utc>) {
+        let mut confirmed = self.confirmed.lock();
+        let newer = match confirmed.as_ref() {
+            Some((cached_id, cached_at)) => {
+                id > *cached_id || (id == *cached_id && at > *cached_at)
+            }
+            None => true,
+        };
+        if newer {
+            *confirmed = Some((id, at));
+        }
+    }
+
+    /// Returns true if a read that returned `id` and finished now can skip the boundary check.
+    ///
+    /// GC deletes a version only after its `min_age`, and only after it advances the boundary
+    /// over it. The successor of the confirmed version was created after the confirmation time.
+    /// If less than `window` passed since then, GC cannot have deleted that successor. So a read
+    /// that did not find the successor proves that the confirmed version is still the latest
+    /// version, and the latest version is always above the boundary.
+    fn trusts(&self, id: MonotonicId) -> bool {
+        let Some((confirmed_id, at)) = *self.confirmed.lock() else {
+            return false;
+        };
+        if confirmed_id != id {
+            return false;
+        }
+        // A clock that moved backward gives an error here. Do not trust the cache then.
+        (self.clock.now() - at)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed < self.window)
+    }
+
+    /// Forgets the confirmation if it covers a version at or below `boundary`.
+    fn forget_through(&self, boundary: MonotonicId) {
+        let mut confirmed = self.confirmed.lock();
+        if matches!(confirmed.as_ref(), Some((id, _)) if *id <= boundary) {
+            *confirmed = None;
+        }
+    }
+}
 
 /// Implements `SequencedStorageProtocol<T>` on object storage.
 ///
@@ -37,6 +96,7 @@ pub struct ObjectStoreSequencedStorageProtocol<T> {
     file_suffix: &'static str,
     boundary: Arc<dyn BoundaryObject>,
     latest: Mutex<Option<(MonotonicId, Bytes)>>,
+    trust: Option<BoundaryTrust>,
 }
 
 impl<T> ObjectStoreSequencedStorageProtocol<T> {
@@ -77,6 +137,41 @@ impl<T> ObjectStoreSequencedStorageProtocol<T> {
             file_suffix,
             boundary,
             latest: Mutex::new(None),
+            trust: None,
+        }
+    }
+
+    /// Lets a latest read skip the boundary GET when this instance confirmed the same version
+    /// less than `window` ago.
+    ///
+    /// A checked latest read or a checked write confirms a version. A later latest read that
+    /// returns the same version, for example because the GET of the next ID returned 404, then
+    /// does not read the boundary file again. The confirmation time is read from `clock`.
+    ///
+    /// The window must be shorter than the GC `min_age` of this directory, minus the largest
+    /// clock skew between the GC host and the object store. If the window is too long, a reader
+    /// that was idle can return a version that GC already replaced and deleted the successors of.
+    /// Without this call, every latest read checks the boundary.
+    pub fn with_boundary_trust_window(
+        mut self,
+        window: Duration,
+        clock: Arc<dyn SystemClock>,
+    ) -> Self {
+        self.trust = Some(BoundaryTrust {
+            window,
+            clock,
+            confirmed: Mutex::new(None),
+        });
+        self
+    }
+
+    fn trust_clock_now(&self) -> Option<DateTime<Utc>> {
+        self.trust.as_ref().map(|trust| trust.clock.now())
+    }
+
+    fn confirm(&self, id: MonotonicId, started: Option<DateTime<Utc>>) {
+        if let (Some(trust), Some(started)) = (self.trust.as_ref(), started) {
+            trust.confirm(id, started);
         }
     }
 
@@ -353,6 +448,9 @@ impl<T: Send + Sync> BoundaryObject for ObjectStoreSequencedStorageProtocol<T> {
         let result = self.boundary.check(id).await;
         if matches!(&result, Err(TransactionalObjectError::ObjectVersionExists)) {
             self.invalidate_cached(id);
+            if let Some(trust) = &self.trust {
+                trust.forget_through(id);
+            }
         }
         result
     }
@@ -360,12 +458,57 @@ impl<T: Send + Sync> BoundaryObject for ObjectStoreSequencedStorageProtocol<T> {
     async fn advance(&self, boundary: MonotonicId) -> Result<(), TransactionalObjectError> {
         self.boundary.advance(boundary).await?;
         self.invalidate_cached_through(boundary);
+        if let Some(trust) = &self.trust {
+            trust.forget_through(boundary);
+        }
         Ok(())
     }
 }
 
 #[async_trait]
 impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorageProtocol<T> {
+    async fn write_checked(
+        &self,
+        current_id: Option<MonotonicId>,
+        new_value: &T,
+    ) -> Result<MonotonicId, TransactionalObjectError> {
+        // The successor of the new version can only be written after the new version exists, so
+        // it is created after this time.
+        let started = self.trust_clock_now();
+        let id = write_checked_default(self, current_id, new_value).await?;
+        self.confirm(id, started);
+        Ok(id)
+    }
+
+    async fn try_read_latest_checked(
+        &self,
+    ) -> Result<Option<(MonotonicId, T)>, TransactionalObjectError> {
+        let Some(trust) = &self.trust else {
+            return try_read_latest_checked_default(self).await;
+        };
+        loop {
+            let started = trust.clock.now();
+            let Some((id, value)) = self.try_read_latest_unchecked().await? else {
+                return Ok(None);
+            };
+            if trust.trusts(id) {
+                trust.confirm(id, started);
+                return Ok(Some((id, value)));
+            }
+            match self.check(id).await {
+                Ok(()) => {
+                    trust.confirm(id, started);
+                    return Ok(Some((id, value)));
+                }
+                Err(TransactionalObjectError::ObjectVersionExists) => {
+                    warn!("sequenced read behind boundary: id={id:?}");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
     async fn write_unchecked(
         &self,
         current_id: Option<MonotonicId>,
@@ -508,6 +651,9 @@ impl<T: Send + Sync> SequencedStorageProtocol<T> for ObjectStoreSequencedStorage
             .await
             .map_err(TransactionalObjectError::from)?;
         self.invalidate_cached(id);
+        if let Some(trust) = &self.trust {
+            trust.forget_through(id);
+        }
         Ok(())
     }
 }
@@ -532,10 +678,12 @@ mod tests {
         ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload,
         PutResult, Result as ObjectStoreResult, UpdateVersion,
     };
+    use slatedb_common::clock::MockSystemClock;
     use std::collections::Bound::{Excluded, Included, Unbounded};
     use std::fmt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
     use tokio::sync::Notify;
 
     /// A flaky object store that simulates a missing file on the first list() call.
@@ -1257,6 +1405,134 @@ mod tests {
         assert!(store.latest.lock().is_none());
     }
 
+    fn new_trusting_protocol(
+        window_secs: u64,
+    ) -> (
+        Arc<CountingGetStore>,
+        Arc<MockSystemClock>,
+        ObjectStoreSequencedStorageProtocol<TestVal>,
+    ) {
+        let counting_store = Arc::new(CountingGetStore::new());
+        let clock = Arc::new(MockSystemClock::new());
+        let protocol = ObjectStoreSequencedStorageProtocol::new(
+            &Path::from("/root"),
+            counting_store.clone(),
+            "test",
+            "val",
+            Box::new(TestValCodec),
+        )
+        .with_boundary_trust_window(Duration::from_secs(window_secs), clock.clone());
+        (counting_store, clock, protocol)
+    }
+
+    fn gets(store: &CountingGetStore) -> usize {
+        store.get_opts_calls.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn test_trust_window_skips_boundary_get_after_missing_successor() {
+        let (object_store, clock, store) = new_trusting_protocol(60);
+        let value = TestVal {
+            epoch: 1,
+            payload: 10,
+        };
+        let id = store.write(None, &value).await.unwrap();
+
+        // The write confirmed the version. The read GETs the next ID, gets 404, and
+        // does not read the boundary.
+        let before = gets(&object_store);
+        let latest = store.try_read_latest().await.unwrap().unwrap();
+        assert_eq!((id, value.clone()), latest);
+        assert_eq!(1, gets(&object_store) - before);
+
+        // Each read that skips the check moves the confirmation forward. So a reader
+        // that polls more often than the window never reads the boundary.
+        for second in [50, 100, 150] {
+            clock.set(second * 1000);
+            let before = gets(&object_store);
+            assert_eq!(id, store.try_read_latest().await.unwrap().unwrap().0);
+            assert_eq!(1, gets(&object_store) - before);
+        }
+        assert_eq!(0, object_store.list_calls.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_trust_window_checks_boundary_after_idle_window() {
+        let (object_store, clock, store) = new_trusting_protocol(60);
+        let value = TestVal {
+            epoch: 1,
+            payload: 10,
+        };
+        let id = store.write(None, &value).await.unwrap();
+
+        clock.set(60_000);
+        let before = gets(&object_store);
+        assert_eq!(id, store.try_read_latest().await.unwrap().unwrap().0);
+        assert_eq!(2, gets(&object_store) - before);
+
+        // The checked read confirmed the version again.
+        let before = gets(&object_store);
+        assert_eq!(id, store.try_read_latest().await.unwrap().unwrap().0);
+        assert_eq!(1, gets(&object_store) - before);
+    }
+
+    #[tokio::test]
+    async fn test_trust_window_checks_boundary_without_confirmation() {
+        let (object_store, _clock, store) = new_trusting_protocol(60);
+        let value = TestVal {
+            epoch: 1,
+            payload: 10,
+        };
+        put_test_value(&object_store, 1, &value).await;
+
+        // A cold read confirms nothing in advance. It must check the boundary.
+        let before = gets(&object_store);
+        assert_eq!(1, store.try_read_latest().await.unwrap().unwrap().0.id());
+        assert_eq!(2, gets(&object_store) - before);
+        assert_eq!(1, object_store.list_calls.load(Ordering::SeqCst));
+
+        // A newer version is not covered by the old confirmation.
+        put_test_value(&object_store, 2, &value).await;
+        let before = gets(&object_store);
+        assert_eq!(2, store.try_read_latest().await.unwrap().unwrap().0.id());
+        assert_eq!(3, gets(&object_store) - before);
+    }
+
+    /// A reader that was idle for longer than the window must not trust a 404 for the
+    /// next ID. GC can delete that ID after it advances the boundary.
+    ///
+    /// 1. The reader confirms version 1 at time 0.
+    /// 2. Another writer writes versions 2 and 3.
+    /// 3. After the window, GC advances the boundary to 2 and deletes versions 1 and 2.
+    /// 4. The reader GETs version 2 and gets 404.
+    ///
+    /// Must see: the reader checks the boundary, drops version 1 and returns version 3.
+    #[tokio::test]
+    async fn test_trust_window_rejects_successor_deleted_after_window() {
+        let (object_store, clock, reader) = new_trusting_protocol(60);
+        let writer = ObjectStoreSequencedStorageProtocol::new(
+            &Path::from("/root"),
+            object_store.clone(),
+            "test",
+            "val",
+            Box::new(TestValCodec),
+        );
+        let value = |payload| TestVal { epoch: 1, payload };
+        let first = reader.write(None, &value(1)).await.unwrap();
+        assert_eq!(first, reader.try_read_latest().await.unwrap().unwrap().0);
+
+        let second = writer.write(Some(first), &value(2)).await.unwrap();
+        let third = writer.write(Some(second), &value(3)).await.unwrap();
+
+        clock.set(61_000);
+        writer.advance(second).await.unwrap();
+        writer.delete(first).await.unwrap();
+        writer.delete(second).await.unwrap();
+
+        let latest = reader.try_read_latest().await.unwrap().unwrap();
+        assert_eq!((third, value(3)), latest);
+    }
+
     /// Validate that try_read_latest retries when a listed file is missing on read.
     #[tokio::test]
     async fn test_try_read_latest_retries_missing_listed_file() {
@@ -1291,6 +1567,7 @@ mod tests {
                 "test",
             )),
             latest: parking_lot::Mutex::new(None),
+            trust: None,
         };
 
         let latest = store.try_read_latest().await.unwrap().unwrap();
