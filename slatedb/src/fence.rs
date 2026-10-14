@@ -110,6 +110,13 @@ impl WriterFencer {
             self.system_clock.clone(),
         )
         .await?;
+        // The epoch update above is a CAS on top of the latest manifest. If
+        // `Admin::close_for_writes` ran before it, this manifest shows the flag.
+        // If it runs after it, it bumps the writer epoch, and the refresh below
+        // fails with `Fenced`.
+        if manifest.manifest().1.core.closed {
+            return Err(SlateDBError::ClosedForWrites);
+        }
         self.fail_point_send("FenceManifest");
 
         let mut manifest = manifest.into();

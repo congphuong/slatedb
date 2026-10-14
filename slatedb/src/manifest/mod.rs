@@ -428,6 +428,11 @@ pub(crate) struct ManifestCore {
     /// refuses to open the database.
     pub wal_name: Option<String>,
 
+    /// `true` when the database is closed for writes (see
+    /// [`crate::admin::Admin::close_for_writes`]). A writer refuses to open a
+    /// closed database. Readers, clones and checkpoints still work.
+    pub closed: bool,
+
     /// The next WAL SST ID to be assigned when creating a new WAL SST. The manifest FlatBuffer
     /// contains `wal_id_last_seen`, which is always one less than this value.
     pub next_wal_sst_id: u64,
@@ -472,6 +477,7 @@ impl ManifestCore {
             segments: vec![],
             segment_extractor_name: None,
             wal_name: None,
+            closed: false,
             next_wal_sst_id: 1,
             replay_after_wal_id: 0,
             last_l0_clock_tick: i64::MIN,
@@ -971,6 +977,12 @@ impl VersionedManifest {
     /// the native SlateDB WAL. See [`crate::wal::WriterInit::wal_name`].
     pub fn wal_name(&self) -> Option<&str> {
         self.manifest.core.wal_name.as_deref()
+    }
+
+    /// Returns `true` when the database is closed for writes. See
+    /// [`crate::admin::Admin::close_for_writes`].
+    pub fn closed_for_writes(&self) -> bool {
+        self.manifest.core.closed
     }
 
     /// Every SST view in this manifest, across the root tree and every

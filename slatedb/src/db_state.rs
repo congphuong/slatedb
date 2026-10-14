@@ -924,6 +924,9 @@ impl<'a> StateModifier<'a> {
             segment_extractor_name: my_db_state.segment_extractor_name.clone(),
             // The writer owns the WAL configuration.
             wal_name: my_db_state.wal_name.clone(),
+            // `Admin::close_for_writes` owns this flag. Keep the stored value so
+            // that a writer never clears it.
+            closed: remote.closed,
             next_wal_sst_id: my_db_state.next_wal_sst_id,
             replay_after_wal_id: my_db_state.replay_after_wal_id,
             last_l0_clock_tick: my_db_state.last_l0_clock_tick,
