@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 test-util = []
 
 [dev-dependencies]
+slatedb-common = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
