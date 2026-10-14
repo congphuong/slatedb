@@ -2027,6 +2027,7 @@ impl ObjectStore for RecordingObjectStore {
 pub(crate) struct CountingObjectStore {
     inner: Arc<dyn ObjectStore>,
     requests: AtomicUsize,
+    get_paths: parking_lot::Mutex<Vec<Path>>,
 }
 
 impl CountingObjectStore {
@@ -2034,11 +2035,21 @@ impl CountingObjectStore {
         Arc::new(Self {
             inner: Arc::new(object_store::memory::InMemory::new()),
             requests: AtomicUsize::new(0),
+            get_paths: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
     pub(crate) fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// Counts the GET requests for paths that end with `suffix`.
+    pub(crate) fn gets_ending_with(&self, suffix: &str) -> usize {
+        self.get_paths
+            .lock()
+            .iter()
+            .filter(|path| path.as_ref().ends_with(suffix))
+            .count()
     }
 
     fn count(&self) {
@@ -2060,6 +2071,7 @@ impl ObjectStore for CountingObjectStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         self.count();
+        self.get_paths.lock().push(location.clone());
         self.inner.get_opts(location, options).await
     }
 

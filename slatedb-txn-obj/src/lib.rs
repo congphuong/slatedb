@@ -670,6 +670,30 @@ pub trait SequencedStorageProtocol<T: Send + Sync>:
     /// implementation for normal checked deletes.
     async fn delete_unchecked(&self, id: MonotonicId) -> Result<(), TransactionalObjectError>;
 
+    /// Write a new version and check it against the durable boundary.
+    ///
+    /// [`TransactionalStorageProtocol::write`] calls this method. The default is
+    /// [`write_checked_default`]. An implementation can override it to record what the check
+    /// proved, but it must keep the check.
+    async fn write_checked(
+        &self,
+        current_id: Option<MonotonicId>,
+        new_value: &T,
+    ) -> Result<MonotonicId, TransactionalObjectError> {
+        write_checked_default(self, current_id, new_value).await
+    }
+
+    /// Read the latest version whose ID is above the durable boundary.
+    ///
+    /// [`TransactionalStorageProtocol::try_read_latest`] calls this method. The default is
+    /// [`try_read_latest_checked_default`]. An implementation can override it to skip the
+    /// boundary check when it can prove that the returned version is above the boundary.
+    async fn try_read_latest_checked(
+        &self,
+    ) -> Result<Option<(MonotonicId, T)>, TransactionalObjectError> {
+        try_read_latest_checked_default(self).await
+    }
+
     /// Deletes the object with the given id. This is only allowed if the id is at or
     /// below the durable boundary.
     ///
@@ -699,25 +723,51 @@ where
         current_id: Option<MonotonicId>,
         new_value: &T,
     ) -> Result<MonotonicId, TransactionalObjectError> {
-        let id = self.write_unchecked(current_id, new_value).await?;
-        self.check(id).await?;
-        Ok(id)
+        self.write_checked(current_id, new_value).await
     }
 
     async fn try_read_latest(&self) -> Result<Option<(MonotonicId, T)>, TransactionalObjectError> {
-        loop {
-            let Some((id, value)) = self.try_read_latest_unchecked().await? else {
-                return Ok(None);
-            };
+        self.try_read_latest_checked().await
+    }
+}
 
-            match self.check(id).await {
-                Ok(()) => return Ok(Some((id, value))),
-                Err(TransactionalObjectError::ObjectVersionExists) => {
-                    warn!("sequenced read behind boundary: id={id:?}");
-                    continue;
-                }
-                Err(err) => return Err(err),
+/// The default [`SequencedStorageProtocol::write_checked`]: create the version, then check it
+/// against the durable boundary.
+pub async fn write_checked_default<T, Store>(
+    store: &Store,
+    current_id: Option<MonotonicId>,
+    new_value: &T,
+) -> Result<MonotonicId, TransactionalObjectError>
+where
+    T: Send + Sync,
+    Store: SequencedStorageProtocol<T> + ?Sized,
+{
+    let id = store.write_unchecked(current_id, new_value).await?;
+    store.check(id).await?;
+    Ok(id)
+}
+
+/// The default [`SequencedStorageProtocol::try_read_latest_checked`]: read the latest version
+/// until its ID is above the durable boundary.
+pub async fn try_read_latest_checked_default<T, Store>(
+    store: &Store,
+) -> Result<Option<(MonotonicId, T)>, TransactionalObjectError>
+where
+    T: Send + Sync,
+    Store: SequencedStorageProtocol<T> + ?Sized,
+{
+    loop {
+        let Some((id, value)) = store.try_read_latest_unchecked().await? else {
+            return Ok(None);
+        };
+
+        match store.check(id).await {
+            Ok(()) => return Ok(Some((id, value))),
+            Err(TransactionalObjectError::ObjectVersionExists) => {
+                warn!("sequenced read behind boundary: id={id:?}");
+                continue;
             }
+            Err(err) => return Err(err),
         }
     }
 }

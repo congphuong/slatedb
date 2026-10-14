@@ -190,14 +190,27 @@ pub(crate) struct CompactionsStore {
 
 impl CompactionsStore {
     pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> =
-            Arc::new(ObjectStoreSequencedStorageProtocol::<Compactions>::new(
-                root_path,
-                object_store,
-                "compactions",
-                "compactions",
-                Box::new(FlatBufferCompactionsCodec {}),
-            ));
+        Self::new_with_boundary_trust(root_path, object_store, None)
+    }
+
+    /// Creates a compactions store whose latest reads can skip the boundary GET. See
+    /// [`crate::DbBuilder::with_boundary_trust_window`].
+    pub(crate) fn new_with_boundary_trust(
+        root_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        trust: Option<(Duration, Arc<dyn SystemClock>)>,
+    ) -> Self {
+        let mut protocol = ObjectStoreSequencedStorageProtocol::<Compactions>::new(
+            root_path,
+            object_store,
+            "compactions",
+            "compactions",
+            Box::new(FlatBufferCompactionsCodec {}),
+        );
+        if let Some((window, clock)) = trust {
+            protocol = protocol.with_boundary_trust_window(window, clock);
+        }
+        let inner: Arc<dyn SequencedStorageProtocol<Compactions>> = Arc::new(protocol);
         Self { inner }
     }
 
