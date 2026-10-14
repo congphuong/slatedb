@@ -130,3 +130,47 @@ async fn closed_database_still_reads_and_clones() {
     );
     clone.close().await.expect("close failed");
 }
+
+#[tokio::test]
+async fn close_at_epoch_refuses_when_another_writer_opened() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = Path::from("/closed/epoch");
+    let db = open(&path, &store).await.expect("open failed");
+    db.put(b"key", b"value").await.expect("put failed");
+    db.close().await.expect("close failed");
+    let epoch = admin(&path, &store)
+        .read_manifest(None)
+        .await
+        .expect("read manifest failed")
+        .expect("the database has a manifest")
+        .writer_epoch();
+
+    // Another writer opens and closes: the epoch moves on.
+    let other = open(&path, &store).await.expect("second open failed");
+    other.close().await.expect("close failed");
+    let err = admin(&path, &store)
+        .close_for_writes_at_epoch(epoch)
+        .await
+        .expect_err("an old epoch must not close the database");
+    assert_eq!(err.kind(), ErrorKind::Closed(CloseReason::Fenced));
+    assert!(!closed_flag(&path, &store).await);
+
+    let epoch = admin(&path, &store)
+        .read_manifest(None)
+        .await
+        .expect("read manifest failed")
+        .expect("the database has a manifest")
+        .writer_epoch();
+    let admin = admin(&path, &store);
+    admin
+        .close_for_writes_at_epoch(epoch)
+        .await
+        .expect("the current epoch closes the database");
+    // A retry succeeds.
+    admin
+        .close_for_writes_at_epoch(epoch)
+        .await
+        .expect("a retry succeeds");
+    assert!(closed_flag(&path, &store).await);
+    assert!(open(&path, &store).await.is_err());
+}

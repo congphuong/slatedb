@@ -686,6 +686,41 @@ impl Admin {
             .map_err(Into::into)
     }
 
+    /// Like [`Self::close_for_writes`], but only when the writer epoch in the
+    /// manifest is still `writer_epoch`. Use it after the writer of that epoch
+    /// closed: if another writer opened the database since then, the epoch is
+    /// higher, and the call fails with [`crate::ErrorKind::Closed`]
+    /// ([`crate::CloseReason::Fenced`]) and changes nothing. That writer can
+    /// still write until its next manifest update, so the caller must not treat
+    /// the database as closed.
+    ///
+    /// A retry after a success sees the flag and the epoch `writer_epoch + 1`,
+    /// and succeeds again.
+    pub async fn close_for_writes_at_epoch(&self, writer_epoch: u64) -> Result<(), crate::Error> {
+        let manifest_store = Arc::new(self.manifest_store());
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+        stored_manifest
+            .maybe_apply_update(|stored_manifest| {
+                let current = stored_manifest.object();
+                if current.core.closed {
+                    if current.writer_epoch == writer_epoch + 1 {
+                        return Ok(None);
+                    }
+                    return Err(SlateDBError::Fenced);
+                }
+                if current.writer_epoch != writer_epoch {
+                    return Err(SlateDBError::Fenced);
+                }
+                let mut dirty = stored_manifest.prepare_dirty()?;
+                dirty.value.core.closed = true;
+                dirty.value.writer_epoch += 1;
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Removes the flag that [`Self::close_for_writes`] sets. A writer can open
     /// the database again. Idempotent.
     pub async fn reopen_for_writes(&self) -> Result<(), crate::Error> {
