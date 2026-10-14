@@ -219,6 +219,9 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                 // The clone uses the WAL implementation of `wal_admin`, which is also the
                 // implementation of every source (see `validate_wal_names`).
                 manifest.core.wal_name = wal_admin.wal_name().map(str::to_string);
+                // A clone is a new database. A source that is closed for writes does
+                // not close its clone.
+                manifest.core.closed = false;
 
                 (
                     StoredManifest::store_uninitialized_clone(

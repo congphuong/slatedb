@@ -670,6 +670,11 @@ impl<P: Into<Path>> DbBuilder<P> {
             latest_manifest
                 .db_state()
                 .validate_wal_name(wal_name.as_deref())?;
+            // Fail early on a closed database. The writer fence checks the
+            // flag again, atomically with the epoch update.
+            if latest_manifest.db_state().closed {
+                return Err(SlateDBError::ClosedForWrites.into());
+            }
         }
 
         // Extract external SSTs from manifest if available

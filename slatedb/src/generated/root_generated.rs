@@ -4255,6 +4255,7 @@ impl<'a> ManifestV2<'a> {
   pub const VT_SEGMENTS: flatbuffers::VOffsetT = 36;
   pub const VT_SEGMENT_EXTRACTOR_NAME: flatbuffers::VOffsetT = 38;
   pub const VT_WAL_NAME: flatbuffers::VOffsetT = 40;
+  pub const VT_CLOSED: flatbuffers::VOffsetT = 42;
 
   #[inline]
   pub unsafe fn init_from_table(table: flatbuffers::Table<'a>) -> Self {
@@ -4284,6 +4285,7 @@ impl<'a> ManifestV2<'a> {
     if let Some(x) = args.ssts { builder.add_ssts(x); }
     if let Some(x) = args.last_compacted_l0_sst_view_id { builder.add_last_compacted_l0_sst_view_id(x); }
     if let Some(x) = args.external_dbs { builder.add_external_dbs(x); }
+    builder.add_closed(args.closed);
     builder.add_initialized(args.initialized);
     builder.finish()
   }
@@ -4422,6 +4424,13 @@ impl<'a> ManifestV2<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(ManifestV2::VT_WAL_NAME, None)}
   }
+  #[inline]
+  pub fn closed(&self) -> bool {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<bool>(ManifestV2::VT_CLOSED, Some(false)).unwrap()}
+  }
 }
 
 impl flatbuffers::Verifiable for ManifestV2<'_> {
@@ -4450,6 +4459,7 @@ impl flatbuffers::Verifiable for ManifestV2<'_> {
      .visit_field::<flatbuffers::ForwardsUOffset<flatbuffers::Vector<'_, flatbuffers::ForwardsUOffset<Segment>>>>("segments", Self::VT_SEGMENTS, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("segment_extractor_name", Self::VT_SEGMENT_EXTRACTOR_NAME, false)?
      .visit_field::<flatbuffers::ForwardsUOffset<&str>>("wal_name", Self::VT_WAL_NAME, false)?
+     .visit_field::<bool>("closed", Self::VT_CLOSED, false)?
      .finish();
     Ok(())
   }
@@ -4474,6 +4484,7 @@ pub struct ManifestV2Args<'a> {
     pub segments: Option<flatbuffers::WIPOffset<flatbuffers::Vector<'a, flatbuffers::ForwardsUOffset<Segment<'a>>>>>,
     pub segment_extractor_name: Option<flatbuffers::WIPOffset<&'a str>>,
     pub wal_name: Option<flatbuffers::WIPOffset<&'a str>>,
+    pub closed: bool,
 }
 impl<'a> Default for ManifestV2Args<'a> {
   #[inline]
@@ -4498,6 +4509,7 @@ impl<'a> Default for ManifestV2Args<'a> {
       segments: None,
       segment_extractor_name: None,
       wal_name: None,
+      closed: false,
     }
   }
 }
@@ -4584,6 +4596,10 @@ impl<'a: 'b, 'b, A: flatbuffers::Allocator + 'a> ManifestV2Builder<'a, 'b, A> {
     self.fbb_.push_slot_always::<flatbuffers::WIPOffset<_>>(ManifestV2::VT_WAL_NAME, wal_name);
   }
   #[inline]
+  pub fn add_closed(&mut self, closed: bool) {
+    self.fbb_.push_slot::<bool>(ManifestV2::VT_CLOSED, closed, false);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut flatbuffers::FlatBufferBuilder<'a, A>) -> ManifestV2Builder<'a, 'b, A> {
     let start = _fbb.start_table();
     ManifestV2Builder {
@@ -4624,6 +4640,7 @@ impl core::fmt::Debug for ManifestV2<'_> {
       ds.field("segments", &self.segments());
       ds.field("segment_extractor_name", &self.segment_extractor_name());
       ds.field("wal_name", &self.wal_name());
+      ds.field("closed", &self.closed());
       ds.finish()
   }
 }

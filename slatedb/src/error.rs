@@ -137,6 +137,9 @@ pub(crate) enum SlateDBError {
     #[error("detected newer DB client")]
     Fenced,
 
+    #[error("the database is closed for writes")]
+    ClosedForWrites,
+
     #[error("invalid cache part size bytes, it must be multiple of 1024 and greater than 0")]
     InvalidCachePartSize,
 
@@ -651,6 +654,8 @@ impl From<SlateDBError> for Error {
             // Closed
             SlateDBError::Closed => Error::closed(msg, CloseReason::Clean),
             SlateDBError::Fenced => Error::closed(msg, CloseReason::Fenced),
+            // A closed database fences every writer, now and later.
+            SlateDBError::ClosedForWrites => Error::closed(msg, CloseReason::Fenced),
             SlateDBError::BackgroundTaskPanic(_) => Error::closed(msg, CloseReason::Panic),
 
             // Unavailable errors
