@@ -337,6 +337,8 @@ impl FlatBufferManifestCodec {
             segment_extractor_name: None,
             // V1 manifests predate pluggable WALs.
             wal_name: None,
+            // V1 manifests predate closed databases.
+            closed: false,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
             last_l0_seq: manifest.last_l0_seq(),
@@ -404,6 +406,7 @@ impl FlatBufferManifestCodec {
         segments.sort_by(|a, b| a.prefix.cmp(&b.prefix));
         let segment_extractor_name = manifest.segment_extractor_name().map(|s| s.to_string());
         let wal_name = manifest.wal_name().map(|s| s.to_string());
+        let closed = manifest.closed();
         let checkpoints: Vec<checkpoint::Checkpoint> = manifest
             .checkpoints()
             .iter()
@@ -456,6 +459,7 @@ impl FlatBufferManifestCodec {
             segments,
             segment_extractor_name,
             wal_name,
+            closed,
             next_wal_sst_id: manifest.wal_id_last_seen() + 1,
             replay_after_wal_id: manifest.replay_after_wal_id(),
             last_l0_seq: manifest.last_l0_seq(),
@@ -1370,6 +1374,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 segments: Some(segments),
                 segment_extractor_name,
                 wal_name,
+                closed: core.closed,
             },
         );
         self.builder.finish(manifest, None);
@@ -1983,6 +1988,20 @@ mod tests {
         assert!(decoded.core.segments.is_empty());
         assert!(decoded.core.segment_extractor_name.is_none());
         assert!(decoded.core.wal_name.is_none());
+    }
+
+    #[test]
+    fn test_should_round_trip_closed_flag() {
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest.core.closed = true;
+        let codec = FlatBufferManifestCodec {};
+
+        let decoded = codec
+            .decode(&codec.encode(&manifest))
+            .expect("failed to decode manifest");
+
+        assert!(decoded.core.closed);
+        assert_eq!(manifest, decoded);
     }
 
     #[test]

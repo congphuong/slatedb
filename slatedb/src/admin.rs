@@ -657,6 +657,54 @@ impl Admin {
             .map_err(Into::into)
     }
 
+    /// Closes the database for writes, for good: after this call, a writer
+    /// refuses to open the database with [`crate::ErrorKind::Closed`]
+    /// ([`crate::CloseReason::Fenced`]). The call also increments the writer
+    /// epoch, so a writer that is open now is fenced at its next manifest
+    /// update. Readers, clones, checkpoints, the compactor and the garbage
+    /// collector still work.
+    ///
+    /// Use it when the data of a database moves to other databases (for
+    /// example after a clone that replaces it), so that no writer can add rows
+    /// that the new databases do not see. [`Self::reopen_for_writes`] removes
+    /// the flag. Idempotent.
+    pub async fn close_for_writes(&self) -> Result<(), crate::Error> {
+        let manifest_store = Arc::new(self.manifest_store());
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+        stored_manifest
+            .maybe_apply_update(|stored_manifest| {
+                if stored_manifest.object().core.closed {
+                    return Ok(None);
+                }
+                let mut dirty = stored_manifest.prepare_dirty()?;
+                dirty.value.core.closed = true;
+                dirty.value.writer_epoch += 1;
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Removes the flag that [`Self::close_for_writes`] sets. A writer can open
+    /// the database again. Idempotent.
+    pub async fn reopen_for_writes(&self) -> Result<(), crate::Error> {
+        let manifest_store = Arc::new(self.manifest_store());
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+        stored_manifest
+            .maybe_apply_update(|stored_manifest| {
+                if !stored_manifest.object().core.closed {
+                    return Ok(None);
+                }
+                let mut dirty = stored_manifest.prepare_dirty()?;
+                dirty.value.core.closed = false;
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Deletes the checkpoint with the specified id.
     pub async fn delete_checkpoint(&self, id: Uuid) -> Result<(), crate::Error> {
         let manifest_store = Arc::new(self.manifest_store());

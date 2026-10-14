@@ -154,6 +154,11 @@ table ManifestV2 {
     // or a reader with a different WAL implementation refuses to open the
     // database.
     wal_name: string;
+
+    // True when the database is closed for writes. A writer refuses to open
+    // a closed database. Readers, clones and checkpoints still work. See
+    // `Admin::close_for_writes`.
+    closed: bool = false;
 }
 
 // Per-segment LSM state. Structurally mirrors the top-level `l0` / `compacted` /
