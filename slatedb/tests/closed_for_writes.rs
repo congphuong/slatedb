@@ -174,3 +174,67 @@ async fn close_at_epoch_refuses_when_another_writer_opened() {
     assert!(closed_flag(&path, &store).await);
     assert!(open(&path, &store).await.is_err());
 }
+
+async fn writer_epoch(path: &Path, store: &Arc<dyn ObjectStore>) -> u64 {
+    admin(path, store)
+        .read_manifest(None)
+        .await
+        .expect("read manifest failed")
+        .expect("the database has a manifest")
+        .writer_epoch()
+}
+
+#[tokio::test]
+async fn reopen_at_epoch_keeps_a_newer_close() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let path = Path::from("/closed/reopen-epoch");
+    let db = open(&path, &store).await.expect("open failed");
+    db.close().await.expect("close failed");
+    let admin = admin(&path, &store);
+
+    // First close. A slow caller reads its epoch now, and removes it later.
+    let epoch = writer_epoch(&path, &store).await;
+    admin
+        .close_for_writes_at_epoch(epoch)
+        .await
+        .expect("first close failed");
+    let first_close = writer_epoch(&path, &store).await;
+    admin
+        .reopen_for_writes_at_epoch(first_close)
+        .await
+        .expect("reopen of the first close failed");
+    assert!(!closed_flag(&path, &store).await);
+
+    // A writer opens, and a second close follows.
+    let db = open(&path, &store).await.expect("open failed");
+    db.close().await.expect("close failed");
+    let epoch = writer_epoch(&path, &store).await;
+    admin
+        .close_for_writes_at_epoch(epoch)
+        .await
+        .expect("second close failed");
+
+    // The slow caller retries its reopen: the second close stays.
+    let err = admin
+        .reopen_for_writes_at_epoch(first_close)
+        .await
+        .expect_err("a reopen for an older close must not remove a newer close");
+    assert_eq!(err.kind(), ErrorKind::Closed(CloseReason::Fenced));
+    assert!(closed_flag(&path, &store).await);
+    assert!(
+        open(&path, &store).await.is_err(),
+        "the database must stay closed"
+    );
+
+    // The reopen for the second close works, and a retry of it succeeds.
+    let second_close = writer_epoch(&path, &store).await;
+    admin
+        .reopen_for_writes_at_epoch(second_close)
+        .await
+        .expect("reopen of the second close failed");
+    admin
+        .reopen_for_writes_at_epoch(second_close)
+        .await
+        .expect("a retry of the reopen must succeed");
+    assert!(!closed_flag(&path, &store).await);
+}
