@@ -706,6 +706,36 @@ impl Admin {
             .map_err(Into::into)
     }
 
+    /// Like [`Self::reopen_for_writes`], but only when the writer epoch in the
+    /// manifest is still `writer_epoch`. Read the epoch of the close that you
+    /// want to remove before you call this method. If another close happened
+    /// since then, the epoch is higher, and the call fails with
+    /// [`crate::ErrorKind::Closed`] ([`crate::CloseReason::Fenced`]) and keeps
+    /// the flag. The check runs again on each retry of the manifest update, so
+    /// a slow retry never removes a newer close.
+    ///
+    /// If the database is not closed, the call does nothing and succeeds.
+    pub async fn reopen_for_writes_at_epoch(&self, writer_epoch: u64) -> Result<(), crate::Error> {
+        let manifest_store = Arc::new(self.manifest_store());
+        let mut stored_manifest =
+            StoredManifest::load(manifest_store, self.system_clock.clone()).await?;
+        stored_manifest
+            .maybe_apply_update(|stored_manifest| {
+                let current = stored_manifest.object();
+                if !current.core.closed {
+                    return Ok(None);
+                }
+                if current.writer_epoch != writer_epoch {
+                    return Err(SlateDBError::Fenced);
+                }
+                let mut dirty = stored_manifest.prepare_dirty()?;
+                dirty.value.core.closed = false;
+                Ok(Some(dirty))
+            })
+            .await
+            .map_err(Into::into)
+    }
+
     /// Deletes the checkpoint with the specified id.
     pub async fn delete_checkpoint(&self, id: Uuid) -> Result<(), crate::Error> {
         let manifest_store = Arc::new(self.manifest_store());
