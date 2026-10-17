@@ -1137,6 +1137,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_name_the_final_checkpoint_after_the_clone_path() {
+        let object_store = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent");
+        let clone_path = Path::from("/tmp/test_clone");
+
+        let parent_db = Db::open(parent_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        parent_db.put(b"key", b"value").await.unwrap();
+        parent_db.flush().await.unwrap();
+        parent_db.close().await.unwrap();
+
+        create_clone(
+            clone_path.clone(),
+            parent_path.clone(),
+            object_store.clone(),
+            object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+
+        let clone_manifest = ManifestStore::new(&clone_path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest;
+        let final_checkpoint_id = clone_manifest
+            .external_dbs
+            .iter()
+            .find(|external_db| external_db.path == parent_path.to_string())
+            .and_then(|external_db| external_db.final_checkpoint_id)
+            .expect("clone references a final checkpoint on the parent");
+        let parent_manifest = ManifestStore::new(&parent_path, object_store.clone())
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest;
+        let checkpoint = parent_manifest
+            .core
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == final_checkpoint_id)
+            .expect("parent holds the final checkpoint of the clone");
+        assert_eq!(checkpoint.name.as_deref(), Some(clone_path.as_ref()));
+    }
+
+    #[tokio::test]
     async fn should_clone_wal_written_after_the_manifest_of_an_open_source() {
         let object_store = Arc::new(InMemory::new());
         let parent_path = Path::from("/tmp/test_parent_open");
