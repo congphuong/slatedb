@@ -305,6 +305,37 @@ impl BytesRange {
             _ => None,
         }
     }
+
+    /// Turn `ranges` into a range set. A range set is a list of ranges that do
+    /// not overlap or touch, sorted by start bound. Ranges that overlap or touch
+    /// become one range. The result covers the same keys as the input.
+    pub(crate) fn normalize_set(ranges: impl IntoIterator<Item = BytesRange>) -> Vec<BytesRange> {
+        let mut ranges: Vec<BytesRange> = ranges.into_iter().collect();
+        ranges.sort_by(|left, right| {
+            left.comparable_start_bound()
+                .cmp(&right.comparable_start_bound())
+        });
+        let mut merged: Vec<BytesRange> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if let Some(last) = merged.last_mut() {
+                if let Some(union) = last.inner.union(&range.inner) {
+                    last.inner = union;
+                    continue;
+                }
+            }
+            merged.push(range);
+        }
+        merged
+    }
+
+    /// Return the keys that both range sets contain, as a range set. An empty
+    /// result means that the sets have no key in common.
+    pub(crate) fn intersect_sets(left: &[BytesRange], right: &[BytesRange]) -> Vec<BytesRange> {
+        Self::normalize_set(
+            left.iter()
+                .flat_map(|l| right.iter().filter_map(move |r| l.intersect(r))),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -577,5 +608,74 @@ pub(crate) mod tests {
         assert!(!range.contains(&Bytes::new())); // b"" < b"" is false for Excluded
         assert!(range.contains(&Bytes::from("a")));
         assert!(range.contains(&Bytes::from("z")));
+    }
+
+    #[test]
+    fn test_normalize_set_sorts_and_merges_overlapping_and_touching_ranges() {
+        let set = BytesRange::normalize_set(vec![
+            BytesRange::from_ref("m".."p"),
+            BytesRange::from_ref("a".."c"),
+            BytesRange::from_ref("b".."d"),
+            BytesRange::from_ref("d".."e"),
+            BytesRange::from_ref("x"..="z"),
+        ]);
+        assert_eq!(
+            set,
+            vec![
+                BytesRange::from_ref("a".."e"),
+                BytesRange::from_ref("m".."p"),
+                BytesRange::from_ref("x"..="z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_normalize_set_keeps_contained_range_inside_larger_range() {
+        let set = BytesRange::normalize_set(vec![
+            BytesRange::from_ref("a".."z"),
+            BytesRange::from_ref("c".."d"),
+        ]);
+        assert_eq!(set, vec![BytesRange::from_ref("a".."z")]);
+    }
+
+    #[test]
+    fn test_intersect_sets() {
+        let left = vec![
+            BytesRange::from_ref("a".."f"),
+            BytesRange::from_ref("m".."t"),
+        ];
+        let right = vec![
+            BytesRange::from_ref("d".."n"),
+            BytesRange::from_ref("s".."u"),
+        ];
+        assert_eq!(
+            BytesRange::intersect_sets(&left, &right),
+            vec![
+                BytesRange::from_ref("d".."f"),
+                BytesRange::from_ref("m".."n"),
+                BytesRange::from_ref("s".."t"),
+            ]
+        );
+        let disjoint = vec![BytesRange::from_ref("g".."h")];
+        assert!(BytesRange::intersect_sets(&left, &disjoint).is_empty());
+    }
+
+    #[test]
+    fn test_intersect_sets_matches_brute_force() {
+        proptest!(|(
+            left in proptest::collection::vec(arbitrary::nonempty_range(4), 1..4),
+            right in proptest::collection::vec(arbitrary::nonempty_range(4), 1..4),
+            key in arbitrary::bytes(4),
+        )| {
+            let left = BytesRange::normalize_set(left);
+            let right = BytesRange::normalize_set(right);
+            let result = BytesRange::intersect_sets(&left, &right);
+            let expected = left.iter().any(|r| r.contains(&key))
+                && right.iter().any(|r| r.contains(&key));
+            prop_assert_eq!(result.iter().any(|r| r.contains(&key)), expected);
+            for pair in result.windows(2) {
+                prop_assert!(pair[0].intersect(&pair[1]).is_none());
+            }
+        });
     }
 }

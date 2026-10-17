@@ -222,11 +222,19 @@ impl SsTableView {
         range: &BytesRange,
     ) -> Option<BytesRange> {
         if let Some(next_view) = next_view {
-            BytesRange::new(
+            let coverage = BytesRange::new(
                 self.compacted_effective_start_bound(),
                 Excluded(next_view.compacted_effective_start_key().clone()),
-            )
-            .intersect(range)
+            );
+            // A view that is already projected must not grow. A projection with
+            // more than one range can put two views of one SST next to each
+            // other in a sorted run. The keys between the two visible ranges
+            // are in the SST, but they are hidden, and they must stay hidden.
+            let coverage = match &self.visible_range {
+                Some(visible_range) => coverage.intersect(visible_range)?,
+                None => coverage,
+            };
+            coverage.intersect(range)
         } else {
             self.effective_range.intersect(range)
         }
