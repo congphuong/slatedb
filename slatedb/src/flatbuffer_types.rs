@@ -1994,6 +1994,18 @@ mod tests {
     }
 
     #[test]
+    fn test_manifest_v2_fork_fields_keep_their_vtable_slots() {
+        // Stored manifests hold `wal_name` and `closed` at these slots. A
+        // flatbuffer field is found by its position, so a field that is added
+        // before them moves them, and then old manifests decode wrong. If this
+        // test fails after a rebase, do not change the numbers. Put the new
+        // upstream field after `closed`, or migrate the stored manifests.
+        assert_eq!(root_generated::ManifestV2::VT_SEGMENT_EXTRACTOR_NAME, 38);
+        assert_eq!(root_generated::ManifestV2::VT_WAL_NAME, 40);
+        assert_eq!(root_generated::ManifestV2::VT_CLOSED, 42);
+    }
+
+    #[test]
     fn test_v1_manifest_has_no_wal_name() {
         // V1 manifests predate pluggable WALs, so they decode as the native WAL.
         let mut manifest = Manifest::initial(ManifestCore::new());
