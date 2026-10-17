@@ -1,4 +1,4 @@
-use std::cmp::{max, min, Ordering};
+use std::cmp::{max, Ordering};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::ops::{Bound, RangeBounds};
@@ -143,13 +143,15 @@ impl LsmTreeState {
 /// - For each tree (the unsegmented `core.tree` participates as a logical
 ///   segment with the empty prefix), `segment_filter` is consulted first.
 ///   When it returns `false`, the tree is dropped entirely.
-/// - Otherwise, the effective range is `segment_projection(prefix)` (validated
+/// - Otherwise, the effective ranges are `segment_projection(prefix)` (validated
 ///   against `[prefix, prefix++)` with `Unbounded` ends resolved to the
-///   segment edges) intersected with `global_range`. Either input is treated
+///   segment edges) intersected with `global_ranges`. Either input is treated
 ///   as "no constraint" when absent.
 #[derive(Clone, Default)]
 pub(crate) struct ProjectionConfig {
-    pub(crate) global_range: Option<BytesRange>,
+    /// The keys to keep, as a range set (see [`BytesRange::normalize_set`]). A
+    /// key is kept when one of the ranges contains it.
+    pub(crate) global_ranges: Option<Vec<BytesRange>>,
     pub(crate) segment_filter: Option<SegmentFilterFn>,
     pub(crate) segment_projection: Option<SegmentProjectionFn>,
 }
@@ -158,8 +160,9 @@ pub(crate) struct ProjectionConfig {
 enum SegmentAction {
     /// Filter rejected this segment — drop it from the projected manifest.
     Drop,
-    /// Apply the carried range as the effective per-tree projection.
-    Project(BytesRange),
+    /// Apply the carried range set as the effective per-tree projection. The
+    /// set is not empty.
+    Project(Vec<BytesRange>),
     /// No projection applies — keep the tree as-is.
     PassThrough,
 }
@@ -167,15 +170,20 @@ enum SegmentAction {
 impl ProjectionConfig {
     #[cfg(test)]
     pub(crate) fn from_global_range(range: BytesRange) -> Self {
+        Self::from_global_ranges(vec![range])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_global_ranges(ranges: Vec<BytesRange>) -> Self {
         Self {
-            global_range: Some(range),
+            global_ranges: Some(BytesRange::normalize_set(ranges)),
             segment_filter: None,
             segment_projection: None,
         }
     }
 
     pub(crate) fn is_noop(&self) -> bool {
-        self.global_range.is_none()
+        self.global_ranges.is_none()
             && self.segment_filter.is_none()
             && self.segment_projection.is_none()
     }
@@ -1039,9 +1047,13 @@ impl Manifest {
     }
 
     /// Apply a `ProjectionConfig` to `source_manifest`, returning a new
-    /// manifest with each tree narrowed to the effective range derived from the
-    /// config. The unsegmented `core.tree` participates as a logical segment
-    /// with the empty prefix.
+    /// manifest with each tree narrowed to the effective ranges derived from
+    /// the config. The unsegmented `core.tree` participates as a logical
+    /// segment with the empty prefix.
+    ///
+    /// When the effective ranges have more than one range, one SST can get
+    /// more than one view. Each view after the first gets a new view ID from
+    /// `rand`.
     ///
     /// Errors with `SlateDBError::InvalidProjection` when a closure-supplied
     /// range falls outside the segment's `[prefix, prefix++)` bounds.
@@ -1059,8 +1071,8 @@ impl Manifest {
         // prefix. Filter+project it through the same path as named segments.
         match Self::resolve_segment_action(b"", config)? {
             SegmentAction::Drop => projected.core.tree = Arc::new(LsmTreeState::default()),
-            SegmentAction::Project(range) => {
-                Self::project_tree_in_place(Arc::make_mut(&mut projected.core.tree), &range, rand)
+            SegmentAction::Project(ranges) => {
+                Self::project_tree_in_place(Arc::make_mut(&mut projected.core.tree), &ranges, rand)
             }
             SegmentAction::PassThrough => {}
         }
@@ -1078,8 +1090,8 @@ impl Manifest {
         for mut segment in segments {
             match Self::resolve_segment_action(&segment.prefix, config)? {
                 SegmentAction::Drop => { /* filtered out */ }
-                SegmentAction::Project(range) => {
-                    Self::project_tree_in_place(Arc::make_mut(&mut segment.tree), &range, rand);
+                SegmentAction::Project(ranges) => {
+                    Self::project_tree_in_place(Arc::make_mut(&mut segment.tree), &ranges, rand);
                     if !segment.tree.l0.is_empty() || !segment.tree.compacted.is_empty() {
                         kept.push(segment);
                     }
@@ -1115,17 +1127,18 @@ impl Manifest {
         } else {
             None
         };
-        let combined = match (segment_range, config.global_range.clone()) {
-            (Some(s), Some(g)) => s.intersect(&g),
-            (Some(s), None) => Some(s),
-            (None, Some(g)) => Some(g),
+        let combined = match (segment_range, &config.global_ranges) {
+            (Some(s), Some(g)) => BytesRange::intersect_sets(&[s], g),
+            (Some(s), None) => vec![s],
+            (None, Some(g)) => g.clone(),
             (None, None) => return Ok(SegmentAction::PassThrough),
         };
-        match combined {
-            Some(range) => Ok(SegmentAction::Project(range)),
+        if combined.is_empty() {
             // Range constraints exist but produced an empty intersection:
             // drop everything in the tree.
-            None => Ok(SegmentAction::Drop),
+            Ok(SegmentAction::Drop)
+        } else {
+            Ok(SegmentAction::Project(combined))
         }
     }
 
@@ -1162,21 +1175,46 @@ impl Manifest {
         Ok(resolved)
     }
 
-    /// Filter `tree.l0` and `tree.compacted` views against `range` in place.
-    /// Sorted runs that lose all views are removed. Watermark fields are
-    /// untouched (the caller decides whether to keep them).
-    fn project_tree_in_place(tree: &mut LsmTreeState, range: &BytesRange, rand: &DbRand) {
+    /// Filter `tree.l0` and `tree.compacted` views against the range set
+    /// `ranges` in place. Sorted runs that lose all views are removed.
+    /// Watermark fields are untouched (the caller decides whether to keep
+    /// them).
+    ///
+    /// A view that intersects more than one range becomes one view for each
+    /// intersection. The views of one L0 SST stay next to each other, in key
+    /// order. The views of a sorted run stay in key order, because the ranges
+    /// are in key order and do not overlap. A view whose range changes gets a
+    /// new ID with the same timestamp (`SsTableView::try_with_visible_range`),
+    /// so the view IDs in L0 stay unique.
+    fn project_tree_in_place(tree: &mut LsmTreeState, ranges: &[BytesRange], rand: &DbRand) {
         if let Some(watermark) = tree.last_compacted_l0_sst_view_id {
             assert!(
                 tree.l0.iter().all(|view| view.id != watermark),
                 "L0 view watermark references an active view: {watermark}"
             );
         }
-        let l0: VecDeque<SsTableView> =
-            Self::filter_view_handles(&tree.l0, true, range, rand).into();
+        let mut l0 = VecDeque::with_capacity(tree.l0.len());
+        for view in &tree.l0 {
+            for range in ranges {
+                l0.extend(Self::filter_view_handles(
+                    std::iter::once(view),
+                    true,
+                    range,
+                    rand,
+                ));
+            }
+        }
         let mut sorted_runs_filtered = vec![];
         for sr in &tree.compacted {
-            let sst_views = Self::filter_view_handles(sr.sst_views().iter(), false, range, rand);
+            let mut sst_views = vec![];
+            for range in ranges {
+                sst_views.extend(Self::filter_view_handles(
+                    sr.sst_views().iter(),
+                    false,
+                    range,
+                    rand,
+                ));
+            }
             if !sst_views.is_empty() {
                 sorted_runs_filtered.push(SortedRun::new(sr.id, sst_views));
             }
@@ -1359,35 +1397,45 @@ impl Manifest {
             .collect();
         Self::ensure_union_prefix_antichain(all_prefixes)?;
 
-        let mut by_prefix: BTreeMap<Bytes, Vec<(BytesRange, &LsmTreeState)>> = BTreeMap::new();
+        let mut by_prefix: BTreeMap<Bytes, Vec<(Vec<BytesRange>, &LsmTreeState)>> = BTreeMap::new();
         for source in sources {
             for segment in &source.manifest.core.segments {
-                if let Some(range) = Self::bounding_range(segment.tree.sst_views()) {
+                let footprint = Self::footprint(segment.tree.sst_views());
+                if !footprint.is_empty() {
                     by_prefix
                         .entry(segment.prefix.clone())
                         .or_default()
-                        .push((range, segment.tree.as_ref()));
+                        .push((footprint, segment.tree.as_ref()));
                 }
             }
         }
 
         let mut grouped = SegmentContributors::new();
         for (prefix, mut members) in by_prefix {
-            members.sort_by_key(|(range, _)| range.comparable_start_bound().cloned());
-            let ranges: Vec<BytesRange> = members.iter().map(|(range, _)| range.clone()).collect();
-            Self::ensure_disjoint_ranges(Some(&prefix), &ranges)?;
+            members.sort_by_key(|(footprint, _)| footprint[0].comparable_start_bound().cloned());
+            let ranges: Vec<BytesRange> = members
+                .iter()
+                .flat_map(|(footprint, _)| footprint.iter().cloned())
+                .collect();
+            Self::ensure_disjoint_ranges(Some(&prefix), ranges)?;
             grouped.insert(prefix, members.into_iter().map(|(_, tree)| tree).collect());
         }
         Ok(grouped)
     }
 
-    /// Reject overlapping source ranges. `ranges` must be sorted by start
-    /// bound. `segment` names the segment under check and is omitted from the
-    /// message for the unsegmented tree.
+    /// Reject overlapping source ranges. `ranges` holds the footprints (see
+    /// [`Self::footprint`]) of all sources. A footprint does not overlap
+    /// itself, so two ranges that overlap come from two different sources.
+    /// `segment` names the segment under check and is omitted from the message
+    /// for the unsegmented tree.
     fn ensure_disjoint_ranges(
         segment: Option<&Bytes>,
-        ranges: &[BytesRange],
+        mut ranges: Vec<BytesRange>,
     ) -> Result<(), SlateDBError> {
+        ranges.sort_by(|left, right| {
+            left.comparable_start_bound()
+                .cmp(&right.comparable_start_bound())
+        });
         for pair in ranges.windows(2) {
             if pair[1].intersect(&pair[0]).is_some() {
                 let scope = match segment {
@@ -1513,24 +1561,27 @@ impl Manifest {
         sources: Vec<CloneSource>,
         rand: Arc<DbRand>,
     ) -> Result<Manifest, SlateDBError> {
-        let mut ranges = vec![];
+        let mut footprints = vec![];
         for source in &sources {
-            let range = source.manifest.range();
-            if let Some(range) = range {
-                ranges.push((source, range));
-            } else {
+            let footprint = Self::footprint(source.manifest.core.all_sst_views());
+            if footprint.is_empty() {
                 warn!("manifest has no SST files [manifest={:?}]", source.manifest);
+            } else {
+                footprints.push((source, footprint));
             }
         }
-        ranges.sort_by_key(|(_, range)| range.comparable_start_bound().cloned());
+        footprints.sort_by_key(|(_, footprint)| footprint[0].comparable_start_bound().cloned());
 
-        let ordered_sources: Vec<&CloneSource> = ranges.iter().map(|(s, _)| *s).collect();
+        let ordered_sources: Vec<&CloneSource> = footprints.iter().map(|(s, _)| *s).collect();
         let mut core = ManifestCore::new();
         core.segment_extractor_name = Self::ensure_consistent_segment_extractor(&sources)?;
 
         if core.segment_extractor_name.is_none() {
-            let all: Vec<BytesRange> = ranges.iter().map(|(_, r)| (*r).clone()).collect();
-            Self::ensure_disjoint_ranges(None, &all)?;
+            let all: Vec<BytesRange> = footprints
+                .iter()
+                .flat_map(|(_, footprint)| footprint.iter().cloned())
+                .collect();
+            Self::ensure_disjoint_ranges(None, all)?;
             Self::build_unsegmented_lsm_state(&mut core, &ordered_sources)?;
         } else {
             let segments = Self::group_segments_for_union(&ordered_sources)?;
@@ -1602,19 +1653,31 @@ impl Manifest {
         })
     }
 
+    /// The keys that `views` can show, as a range set (see
+    /// [`BytesRange::normalize_set`]). The set is empty when `views` is empty.
+    ///
+    /// A union checks footprints, not one bounding range for each source. A
+    /// source that was projected on more than one range has a gap between its
+    /// ranges, and another source can fill that gap.
+    fn footprint<'a>(views: impl Iterator<Item = &'a SsTableView>) -> Vec<BytesRange> {
+        BytesRange::normalize_set(views.map(|view| view.compacted_effective_range().clone()))
+    }
+
+    #[cfg(test)]
     fn range(&self) -> Option<BytesRange> {
         Self::bounding_range(self.core.all_sst_views())
     }
 
     /// Smallest range covering every view in `views`, or `None` when `views`
     /// is empty.
+    #[cfg(test)]
     fn bounding_range<'a>(views: impl Iterator<Item = &'a SsTableView>) -> Option<BytesRange> {
         let mut start_bound = None;
         let mut end_bound = None;
         for sst in views {
             let range = sst.compacted_effective_range();
             start_bound = start_bound
-                .map(|b| min(b, range.comparable_start_bound()))
+                .map(|b| std::cmp::min(b, range.comparable_start_bound()))
                 .or_else(|| Some(range.comparable_start_bound()));
             end_bound = end_bound
                 .map(|b| max(b, range.comparable_end_bound()))
@@ -1659,11 +1722,13 @@ impl Manifest {
             .flat_map(|db| db.sst_ids.iter().copied())
             .collect();
         // Owned SSTs = SSTs in any tree (unsegmented + each segment) not
-        // already delegated to an external_db.
+        // already delegated to an external_db. One SST can have more than one
+        // view, so each ID is listed once.
+        let mut seen_ids = HashSet::new();
         self.core
             .all_sst_views()
             .map(|v| v.sst.id)
-            .filter(|id| !source_external_sst_ids.contains(id))
+            .filter(|id| !source_external_sst_ids.contains(id) && seen_ids.insert(*id))
             .collect()
     }
 
@@ -1693,6 +1758,7 @@ mod tests {
     use crate::error::SlateDBError;
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::manifest::{LsmTreeState, ManifestCore, ProjectionConfig, Segment};
+    use crate::test_utils;
     use crate::Checkpoint;
     use bytes::Bytes;
     use object_store::memory::InMemory;
@@ -2266,6 +2332,269 @@ mod tests {
         assert_eq!(compactor.merge_from_writer(&writer).l0, expected);
     }
 
+    fn manifest_with_views(l0: Vec<SsTableView>, sorted_runs: Vec<Vec<SsTableView>>) -> Manifest {
+        let mut core = ManifestCore::new();
+        let tree = Arc::make_mut(&mut core.tree);
+        tree.l0 = l0.into();
+        let count = sorted_runs.len();
+        tree.compacted = sorted_runs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, views)| SortedRun::new((count - 1 - idx) as u32, views))
+            .collect();
+        Manifest::initial(core)
+    }
+
+    fn visible(view: &SsTableView) -> BytesRange {
+        view.visible_range.clone().expect("projected view")
+    }
+
+    fn key_is_visible(manifest: &Manifest, key: &'static [u8]) -> bool {
+        manifest.core.all_sst_views().any(|view| {
+            view.compacted_effective_range()
+                .contains(&Bytes::from_static(key))
+        })
+    }
+
+    fn clone_source(manifest: Manifest, idx: usize) -> CloneSource {
+        CloneSource {
+            manifest,
+            path: Path::from(format!("/tmp/source{}", idx)),
+            checkpoint: new_checkpoint(Uuid::new_v4()),
+        }
+    }
+
+    #[test]
+    fn test_projected_with_two_ranges_gives_one_view_per_range() {
+        // given: L0 SSTs and a sorted run that span both ranges and the gap
+        // between them
+        let spanning = test_utils::bounded_sst_view(1, b"a", b"z");
+        let in_gap = test_utils::bounded_sst_view(2, b"n", b"o");
+        let first_only = test_utils::bounded_sst_view(3, b"c", b"d");
+        let sr_a = test_utils::bounded_sst_view(4, b"a", b"f");
+        let sr_g = test_utils::bounded_sst_view(5, b"g", b"q");
+        let sr_r = test_utils::bounded_sst_view(6, b"r", b"z");
+        let manifest = manifest_with_views(
+            vec![spanning.clone(), in_gap, first_only.clone()],
+            vec![vec![sr_a.clone(), sr_g.clone(), sr_r.clone()]],
+        );
+        let config = ProjectionConfig::from_global_ranges(vec![
+            BytesRange::from_ref("p".."t"),
+            BytesRange::from_ref("b".."e"),
+        ]);
+
+        // when
+        let projected = Manifest::projected(&manifest, &config, &DbRand::new(7)).unwrap();
+
+        // then: an L0 SST gets one view for each range that it intersects, and
+        // an SST in the gap is dropped
+        let l0: Vec<(SsTableId, BytesRange)> = projected
+            .core
+            .tree
+            .l0
+            .iter()
+            .map(|view| (view.sst.id, visible(view)))
+            .collect();
+        assert_eq!(
+            l0,
+            vec![
+                (spanning.sst.id, BytesRange::from_ref("b".."e")),
+                (spanning.sst.id, BytesRange::from_ref("p".."t")),
+                (first_only.sst.id, BytesRange::from_ref("c"..="d")),
+            ]
+        );
+        // each view with a changed range gets a new ID with the same
+        // timestamp, so the L0 view IDs stay unique
+        let l0 = &projected.core.tree.l0;
+        assert_ne!(l0[0].id, spanning.id);
+        assert_ne!(l0[1].id, spanning.id);
+        assert_ne!(l0[0].id, l0[1].id);
+        assert_eq!(l0[0].id.timestamp_ms(), spanning.id.timestamp_ms());
+        assert_eq!(l0[1].id.timestamp_ms(), spanning.id.timestamp_ms());
+        assert_ne!(l0[2].id, first_only.id);
+        assert_eq!(l0[2].id.timestamp_ms(), first_only.id.timestamp_ms());
+
+        // then: the sorted run keeps its views in key order
+        let sr: Vec<(SsTableId, BytesRange)> = projected.core.tree.compacted[0]
+            .sst_views()
+            .iter()
+            .map(|view| (view.sst.id, visible(view)))
+            .collect();
+        assert_eq!(
+            sr,
+            vec![
+                (sr_a.sst.id, BytesRange::from_ref("b".."e")),
+                (sr_g.sst.id, BytesRange::from_ref("p".."r")),
+                (sr_r.sst.id, BytesRange::from_ref("r".."t")),
+            ]
+        );
+
+        // then: keys in both ranges are visible, keys in the gap and outside
+        // are not
+        for key in [b"b", b"d", b"p", b"s"] {
+            assert!(key_is_visible(&projected, key), "{:?}", key);
+        }
+        for key in [b"a", b"e", b"h", b"n", b"o", b"t", b"z"] {
+            assert!(!key_is_visible(&projected, key), "{:?}", key);
+        }
+    }
+
+    #[test]
+    fn test_projected_does_not_widen_a_projected_view() {
+        // given: a sorted run with two views of one SST, from a projection on
+        // two ranges
+        let sst = test_utils::bounded_sst_view(1, b"a", b"z");
+        let manifest = manifest_with_views(vec![], vec![vec![sst]]);
+        let two_ranges = ProjectionConfig::from_global_ranges(vec![
+            BytesRange::from_ref("b".."e"),
+            BytesRange::from_ref("p".."t"),
+        ]);
+        let child = Manifest::projected(&manifest, &two_ranges, &DbRand::new(7)).unwrap();
+        assert_eq!(child.core.tree.compacted[0].sst_views().len(), 2);
+
+        // when: the result is projected on a range that covers the gap
+        let wide = ProjectionConfig::from_global_range(BytesRange::from_ref("a".."z"));
+        let grandchild = Manifest::projected(&child, &wide, &DbRand::new(7)).unwrap();
+
+        // then: the keys between the two ranges stay hidden
+        let ranges: Vec<BytesRange> = grandchild.core.tree.compacted[0]
+            .sst_views()
+            .iter()
+            .map(visible)
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                BytesRange::from_ref("b".."e"),
+                BytesRange::from_ref("p".."t"),
+            ]
+        );
+        assert!(!key_is_visible(&grandchild, b"h"));
+    }
+
+    #[test]
+    fn test_projected_with_disjoint_segment_and_global_ranges_drops_tree() {
+        // given
+        let manifest =
+            manifest_with_views(vec![test_utils::bounded_sst_view(1, b"a", b"z")], vec![]);
+        let config = ProjectionConfig::from_global_ranges(vec![]);
+
+        // when
+        let projected = Manifest::projected(&manifest, &config, &DbRand::new(7)).unwrap();
+
+        // then: an empty range set keeps no keys
+        assert!(projected.core.tree.l0.is_empty());
+    }
+
+    #[test]
+    fn test_union_accepts_sources_with_interleaved_ranges() {
+        // given: two clones of one parent, each projected on two ranges. The
+        // bounding ranges of the clones overlap, but their keys do not.
+        let parent = manifest_with_views(vec![test_utils::bounded_sst_view(1, b"a", b"z")], vec![]);
+        let rand = DbRand::new(7);
+        let left = Manifest::projected(
+            &parent,
+            &ProjectionConfig::from_global_ranges(vec![
+                BytesRange::from_ref("b".."e"),
+                BytesRange::from_ref("p".."s"),
+            ]),
+            &rand,
+        )
+        .unwrap();
+        let right = Manifest::projected(
+            &parent,
+            &ProjectionConfig::from_global_ranges(vec![
+                BytesRange::from_ref("e".."h"),
+                BytesRange::from_ref("s".."v"),
+            ]),
+            &rand,
+        )
+        .unwrap();
+        // the two clones give the views of the shared parent SST different IDs
+        assert_ne!(left.core.tree.l0[0].id, right.core.tree.l0[0].id);
+
+        // when
+        let union = Manifest::cloned_from_union(
+            vec![clone_source(right, 1), clone_source(left, 0)],
+            Arc::new(DbRand::new(7)),
+        )
+        .unwrap();
+
+        // then
+        let l0: Vec<BytesRange> = union.core.tree.l0.iter().map(visible).collect();
+        assert_eq!(
+            l0,
+            vec![
+                BytesRange::from_ref("b".."e"),
+                BytesRange::from_ref("p".."s"),
+                BytesRange::from_ref("e".."h"),
+                BytesRange::from_ref("s".."v"),
+            ]
+        );
+        let view_ids: HashSet<Ulid> = union.core.tree.l0.iter().map(|view| view.id).collect();
+        assert_eq!(view_ids.len(), 4);
+        assert!(!key_is_visible(&union, b"j"));
+    }
+
+    #[test]
+    fn test_union_rejects_sources_that_overlap_in_a_gap() {
+        // given: the right source has keys in the gap of the left source, and
+        // also in the left source's first range
+        let parent = manifest_with_views(vec![test_utils::bounded_sst_view(1, b"a", b"z")], vec![]);
+        let rand = DbRand::new(7);
+        let left = Manifest::projected(
+            &parent,
+            &ProjectionConfig::from_global_ranges(vec![
+                BytesRange::from_ref("b".."e"),
+                BytesRange::from_ref("p".."s"),
+            ]),
+            &rand,
+        )
+        .unwrap();
+        let right = Manifest::projected(
+            &parent,
+            &ProjectionConfig::from_global_range(BytesRange::from_ref("d".."h")),
+            &rand,
+        )
+        .unwrap();
+
+        // when
+        let result = Manifest::cloned_from_union(
+            vec![clone_source(left, 0), clone_source(right, 1)],
+            Arc::new(DbRand::new(7)),
+        );
+
+        // then
+        assert!(matches!(result, Err(SlateDBError::InvalidUnion(_))));
+    }
+
+    #[test]
+    fn test_merge_keeps_uncompacted_view_of_a_partly_compacted_sst() {
+        // given: two L0 views of one SST, as a projection on two ranges makes
+        // them, and a compactor that compacted only the older view
+        let newest = test_utils::bounded_sst_view(3, b"a", b"z");
+        let sst = test_utils::bounded_sst_view(1, b"a", b"z");
+        let first = sst.with_visible_range(BytesRange::from_ref("b".."e"));
+        let mut second = sst.with_visible_range(BytesRange::from_ref("p".."t"));
+        second.id = Ulid::from_parts(1, 1);
+        let writer = LsmTreeState {
+            l0: VecDeque::from(vec![newest.clone(), first.clone(), second.clone()]),
+            ..LsmTreeState::default()
+        };
+        let compactor = LsmTreeState {
+            last_compacted_l0_sst_view_id: Some(second.id),
+            last_compacted_l0_sst_id: Some(second.sst.id.value()),
+            ..LsmTreeState::default()
+        };
+
+        // when
+        let merged = writer.merge_from_compactor(&compactor);
+
+        // then: the first view shares the SST ID of the watermark, but the
+        // compactor did not compact it
+        assert_eq!(merged.l0, VecDeque::from(vec![newest, first]));
+    }
+
     #[test]
     fn test_lsm_tree_merge_invariants() {
         // Build a writer L0 with `n` views whose view IDs and SST IDs are all
@@ -2432,7 +2761,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, id)| {
-                let mut view = crate::test_utils::bounded_sst_view(i as u64 + 1, b"a", b"z")
+                let mut view = test_utils::bounded_sst_view(i as u64 + 1, b"a", b"z")
                     .with_visible_range(BytesRange::from_ref("a".."m"));
                 view.id = Ulid::from_parts(10, *id);
                 view
@@ -2442,7 +2771,7 @@ mod tests {
             l0: views,
             compacted: vec![SortedRun::new(
                 0,
-                [crate::test_utils::bounded_sst_view(20, b"a", b"z")],
+                [test_utils::bounded_sst_view(20, b"a", b"z")],
             )],
             last_compacted_l0_sst_view_id: Some(Ulid::from_parts(10, 99)),
             last_compacted_l0_sst_id: Some(Ulid::from_parts(9, 0)),
@@ -2492,7 +2821,7 @@ mod tests {
         #[values(false, true)] segmented: bool,
         #[values(false, true)] duplicate: bool,
     ) {
-        let view = crate::test_utils::bounded_sst_view(10, b"a", b"z");
+        let view = test_utils::bounded_sst_view(10, b"a", b"z");
         let mut tree = LsmTreeState {
             l0: VecDeque::from([view.clone()]),
             last_compacted_l0_sst_view_id: Some(view.id),
@@ -2525,7 +2854,7 @@ mod tests {
 
     #[test]
     fn test_projection_preserves_compacted_watermarks() {
-        let view = crate::test_utils::bounded_sst_view(10, b"a", b"z");
+        let view = test_utils::bounded_sst_view(10, b"a", b"z");
         let mut tree = LsmTreeState {
             l0: VecDeque::from([view.clone()]),
             last_compacted_l0_sst_view_id: Some(Ulid::from_parts(9, 0)),
@@ -2536,7 +2865,7 @@ mod tests {
 
         Manifest::project_tree_in_place(
             &mut tree,
-            &BytesRange::from_ref("a".."m"),
+            &[BytesRange::from_ref("a".."m")],
             &DbRand::new(42),
         );
 
@@ -5664,7 +5993,7 @@ mod tests {
             })
         });
         let config = ProjectionConfig {
-            global_range: None,
+            global_ranges: None,
             segment_filter: None,
             segment_projection: Some(projector),
         };
@@ -5699,7 +6028,7 @@ mod tests {
         let manifest = manifest_with_full_segments("hour", &[b"hour=11/", b"hour=12/"]);
         let filter: SegmentFilterFn = Arc::new(|p: &[u8]| p != b"hour=12/");
         let config = ProjectionConfig {
-            global_range: None,
+            global_ranges: None,
             segment_filter: Some(filter),
             segment_projection: None,
         };
@@ -5716,7 +6045,7 @@ mod tests {
             manifest_with_segment(b"", None, b"a", BytesRange::from_ref("a".."z"));
         let filter: SegmentFilterFn = Arc::new(|p: &[u8]| !p.is_empty());
         let config = ProjectionConfig {
-            global_range: None,
+            global_ranges: None,
             segment_filter: Some(filter),
             segment_projection: None,
         };
@@ -5734,7 +6063,7 @@ mod tests {
         let projector: SegmentProjectionFn =
             Arc::new(|_prefix: &[u8]| Ok(BytesRange::from_ref("hour=11/a".."hour=11/z")));
         let config = ProjectionConfig {
-            global_range: Some(BytesRange::from_ref("hour=11/c".."hour=11/m")),
+            global_ranges: Some(vec![BytesRange::from_ref("hour=11/c".."hour=11/m")]),
             segment_filter: None,
             segment_projection: Some(projector),
         };
@@ -5765,7 +6094,7 @@ mod tests {
             })
         });
         let config = ProjectionConfig {
-            global_range: Some(BytesRange::from_ref("hour=12/a".."hour=12/z")),
+            global_ranges: Some(vec![BytesRange::from_ref("hour=12/a".."hour=12/z")]),
             segment_filter: None,
             segment_projection: Some(projector),
         };
@@ -5781,7 +6110,7 @@ mod tests {
         let projector: SegmentProjectionFn =
             Arc::new(|_prefix: &[u8]| Ok(BytesRange::from_ref("a".."m")));
         let config = ProjectionConfig {
-            global_range: None,
+            global_ranges: None,
             segment_filter: None,
             segment_projection: Some(projector),
         };

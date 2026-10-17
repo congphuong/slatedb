@@ -235,7 +235,6 @@ impl<T: Ord + Clone> ComparableRange<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn union(&self, other: &Self) -> Option<Self> {
         // Sort the ranges to make the function commutative
         let (first, second) = if self < other {

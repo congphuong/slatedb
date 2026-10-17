@@ -51,9 +51,10 @@ pub(crate) async fn warm_sst_impl(
 
     // Reuse the handle embedded in the manifest view instead of calling
     // `open_sst`, which would issue an extra object_store GET for info+version.
-    // RFC-0024: walk every tree (unsegmented + segments). Each SST id appears
-    // in at most one view (segments have disjoint key spaces; within a tree an
-    // SST is in either L0 or one SR), so `find` is enough.
+    // RFC-0024: walk every tree (unsegmented + segments). Segments have
+    // disjoint key spaces, so an SST is in one tree only. But a projection
+    // with more than one range can give one SST more than one view in that
+    // tree, so collect the visible ranges of all its views.
     let Some((segment, view)) = find_sst(manifest, &sst_id) else {
         debug!(
             "warm_sst: SST {:?} not reachable from current manifest",
@@ -62,9 +63,12 @@ pub(crate) async fn warm_sst_impl(
         return Ok(());
     };
     let handle = view.sst.clone();
-    let visible_ranges: Vec<BytesRange> = view
-        .calculate_view_range(BytesRange::unbounded())
+    let visible_ranges: Vec<BytesRange> = manifest
+        .tree_for_segment(&segment)
         .into_iter()
+        .flat_map(|tree| tree.sst_views())
+        .filter(|view| view.sst.id == sst_id)
+        .filter_map(|view| view.calculate_view_range(BytesRange::unbounded()))
         .collect();
     // Shared lazy index — populated at most once, so parallel target fanout
     // can share a single object-store read.

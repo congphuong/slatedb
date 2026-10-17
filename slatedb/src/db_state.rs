@@ -247,7 +247,13 @@ impl SsTableView {
             };
             let intersection =
                 BytesRange::new(self.compacted_effective_start_bound(), end).intersect(range)?;
-            // A new projection must preserve gaps from earlier projections.
+            // A new projection must preserve gaps from earlier projections: a view
+            // that is already projected must not grow. A projection with more than
+            // one range can put two views of one SST next to each other in a sorted
+            // run. The keys between the two visible ranges are in the SST, but they
+            // are hidden, and they must stay hidden. `end` can only add `next_key`
+            // when this view's effective range (already cut to its visible range)
+            // holds it.
             match &self.visible_range {
                 Some(visible) => intersection.intersect(visible),
                 None => Some(intersection),
