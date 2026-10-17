@@ -51,7 +51,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     fp_registry: Arc<FailPointRegistry>,
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
-    projection_range: Option<R>,
+    projection_ranges: Option<Vec<R>>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
 ) -> Result<(), SlateDBError> {
@@ -69,7 +69,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
         system_clock.clone(),
         rand,
         fp_registry.clone(),
-        projection_range,
+        projection_ranges,
         segment_filter,
         segment_projection,
         wal_admin.as_ref(),
@@ -102,7 +102,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     system_clock: Arc<dyn SystemClock>,
     rand: Arc<DbRand>,
     #[allow(unused)] fp_registry: Arc<FailPointRegistry>,
-    projection_range: Option<R>,
+    projection_ranges: Option<Vec<R>>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
     wal_admin: &dyn WalAdmin,
@@ -149,7 +149,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                             &object_store,
                             &system_clock,
                             &rand,
-                            &projection_range,
+                            &projection_ranges,
                             segment_filter.as_ref(),
                             segment_projection.as_ref(),
                         )
@@ -166,7 +166,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     &object_store,
                     &system_clock,
                     &rand,
-                    &projection_range,
+                    &projection_ranges,
                     segment_filter.as_ref(),
                     segment_projection.as_ref(),
                 )
@@ -176,10 +176,10 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     _ => None,
                 };
 
-                let projection_requested = projection_range.is_some()
+                let projection_requested = projection_ranges.is_some()
                     || segment_filter.is_some()
                     || segment_projection.is_some()
-                    || source_specs.iter().any(|s| s.projection_range.is_some());
+                    || source_specs.iter().any(|s| s.projection_ranges.is_some());
 
                 let mut manifest: Manifest = match &sources[..] {
                     [single_source] => {
@@ -264,8 +264,26 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     })
 }
 
-fn to_byte_range<T: RangeBounds<Bytes> + Clone>(bounds: &T) -> BytesRange {
-    BytesRange::from(bounds.clone())
+/// Turn user-supplied projection ranges into a range set (see
+/// [`BytesRange::normalize_set`]). Errors with
+/// `SlateDBError::InvalidProjection` when the list is empty or when one of the
+/// ranges is empty.
+fn to_range_set<T: RangeBounds<Bytes>>(ranges: &[T]) -> Result<Vec<BytesRange>, SlateDBError> {
+    let invalid = |reason: &str| SlateDBError::InvalidProjection {
+        prefix: Bytes::new(),
+        reason: reason.into(),
+    };
+    if ranges.is_empty() {
+        return Err(invalid("projection has no ranges"));
+    }
+    let ranges = ranges
+        .iter()
+        .map(|range| {
+            BytesRange::try_new(range.start_bound().cloned(), range.end_bound().cloned())
+                .ok_or_else(|| invalid("empty range"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BytesRange::normalize_set(ranges))
 }
 
 #[derive(Clone)]
@@ -283,7 +301,7 @@ impl CloneSource {
 
 /// Builds a list of clone sources from the provided specifications. For each source spec, a
 /// manifest at the specified checkpoint is loaded (if the checkpoint is not specified then it is
-/// created). Additionally, if any of `projection_range`, `segment_filter`, or
+/// created). Additionally, if any of `projection_ranges`, `segment_filter`, or
 /// `segment_projection` are specified then they are applied to the returned
 /// manifests using `Manifest::projected`.
 async fn build_sources<R: RangeBounds<Bytes> + Clone>(
@@ -291,7 +309,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
     object_store: &Arc<dyn ObjectStore>,
     system_clock: &Arc<dyn SystemClock>,
     rand: &Arc<DbRand>,
-    projection_range: &Option<R>,
+    projection_ranges: &Option<Vec<R>>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
 ) -> Result<Vec<CloneSource>, SlateDBError> {
@@ -304,7 +322,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
                 object_store,
                 system_clock,
                 rand,
-                projection_range,
+                projection_ranges,
                 segment_filter,
                 segment_projection,
             )
@@ -320,7 +338,7 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
     object_store: &Arc<dyn ObjectStore>,
     system_clock: &Arc<dyn SystemClock>,
     rand: &Arc<DbRand>,
-    projection_range: &Option<R>,
+    projection_ranges: &Option<Vec<R>>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
 ) -> Result<CloneSource, SlateDBError> {
@@ -331,15 +349,23 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
         get_or_create_parent_checkpoint(&mut latest_manifest, checkpoint_id, rand.clone()).await?;
     let mut manifest_at_checkpoint = manifest_store.read_manifest(checkpoint.manifest_id).await?;
 
-    let range: Option<BytesRange> = match (source.projection_range.clone(), projection_range) {
-        (Some(l), Some(r)) => to_byte_range(&l).intersect(&to_byte_range(r)),
-        (Some(l), None) => Some(to_byte_range(&l)),
-        (None, Some(r)) => Some(to_byte_range(r)),
+    let source_ranges = source
+        .projection_ranges
+        .as_deref()
+        .map(to_range_set)
+        .transpose()?;
+    let global_ranges = projection_ranges.as_deref().map(to_range_set).transpose()?;
+    let ranges: Option<Vec<BytesRange>> = match (source_ranges, global_ranges) {
+        // An empty intersection is kept as an empty set: the source then
+        // contributes no keys.
+        (Some(l), Some(r)) => Some(BytesRange::intersect_sets(&l, &r)),
+        (Some(l), None) => Some(l),
+        (None, Some(r)) => Some(r),
         (None, None) => None,
     };
 
     let config = ProjectionConfig {
-        global_range: range,
+        global_ranges: ranges,
         segment_filter: segment_filter.cloned(),
         segment_projection: segment_projection.cloned(),
     };
@@ -370,7 +396,7 @@ async fn rebuild_source<R: RangeBounds<Bytes> + Clone>(
     object_store: &Arc<dyn ObjectStore>,
     system_clock: &Arc<dyn SystemClock>,
     rand: &Arc<DbRand>,
-    projection_range: &Option<R>,
+    projection_ranges: &Option<Vec<R>>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
 ) -> Result<CloneSource, SlateDBError> {
@@ -401,7 +427,7 @@ async fn rebuild_source<R: RangeBounds<Bytes> + Clone>(
         object_store,
         system_clock,
         rand,
-        projection_range,
+        projection_ranges,
         segment_filter,
         segment_projection,
     )
@@ -587,9 +613,10 @@ async fn copy_wal(
 #[cfg(test)]
 mod tests {
     use super::{SegmentFilterFn, SegmentProjectionFn};
+    use crate::compactor::CompactorBuilder;
     use crate::config::{
-        CheckpointOptions, CheckpointScope, CloseOptions, FlushOptions, FlushType, PutOptions,
-        Settings, WriteOptions,
+        CheckpointOptions, CheckpointScope, CloseOptions, CompactionWorkerOptions,
+        CompactorOptions, FlushOptions, FlushType, PutOptions, Settings, WriteOptions,
     };
     use crate::db::builder::CloneSourceSpec;
     use crate::db::Db;
@@ -620,6 +647,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ops::Bound;
     use std::ops::RangeBounds;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use uuid::Uuid;
@@ -683,7 +711,7 @@ mod tests {
         fp_registry: Arc<FailPointRegistry>,
         system_clock: Arc<dyn SystemClock>,
         rand: Arc<DbRand>,
-        projection_range: Option<R>,
+        projection_ranges: Option<Vec<R>>,
         segment_filter: Option<SegmentFilterFn>,
         segment_projection: Option<SegmentProjectionFn>,
     ) -> Result<(), SlateDBError> {
@@ -696,7 +724,7 @@ mod tests {
             fp_registry,
             system_clock,
             rand,
-            projection_range,
+            projection_ranges,
             segment_filter,
             segment_projection,
         )
@@ -790,7 +818,7 @@ mod tests {
                 fp.clone(),
                 clock.clone(),
                 rand.clone(),
-                Some(range),
+                Some(vec![range]),
                 None,
                 None,
             )
@@ -830,7 +858,7 @@ mod tests {
             fp,
             clock.clone(),
             rand,
-            None::<(Bound<Bytes>, Bound<Bytes>)>,
+            None::<Vec<(Bound<Bytes>, Bound<Bytes>)>>,
             None,
             None,
         )
@@ -2026,7 +2054,7 @@ mod tests {
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            Some(range.clone()),
+            Some(vec![range.clone()]),
             None,
             None,
         )
@@ -2060,7 +2088,7 @@ mod tests {
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            Some(range),
+            Some(vec![range]),
             None,
             None,
         )
@@ -2177,7 +2205,7 @@ mod tests {
             Arc::new(FailPointRegistry::new()),
             Arc::new(DefaultSystemClock::new()),
             Arc::new(DbRand::default()),
-            projection,
+            projection.map(|range| vec![range]),
             None,
             None,
         )
@@ -3084,5 +3112,293 @@ mod tests {
             ),
             "expected NotFound for the missing WAL object, got {err:?}"
         );
+    }
+
+    /// A key space with three regions: `hot/` and `row/` hold rows that a
+    /// tenant range owns, `idx/` holds rows that no tenant range owns. A tenant
+    /// range is one range in `hot/` and one range in `row/`.
+    fn three_region_table() -> BTreeMap<Bytes, Bytes> {
+        BTreeMap::from([
+            (Bytes::from_static(b"hot/1"), Bytes::from_static(b"h1")),
+            (Bytes::from_static(b"hot/7"), Bytes::from_static(b"h7")),
+            (Bytes::from_static(b"idx/1"), Bytes::from_static(b"i1")),
+            (Bytes::from_static(b"row/1"), Bytes::from_static(b"r1")),
+            (Bytes::from_static(b"row/7"), Bytes::from_static(b"r7")),
+        ])
+    }
+
+    type KeyRange = (Bound<Bytes>, Bound<Bytes>);
+
+    fn tenant_ranges(lo: &'static [u8], hi: &'static [u8]) -> Vec<KeyRange> {
+        let key = |region: &[u8], suffix: &[u8]| Bytes::from([region, suffix].concat());
+        vec![
+            (
+                Bound::Included(key(b"hot/", lo)),
+                Bound::Excluded(key(b"hot/", hi)),
+            ),
+            (
+                Bound::Included(key(b"row/", lo)),
+                Bound::Excluded(key(b"row/", hi)),
+            ),
+        ]
+    }
+
+    async fn build_parent(path: &Path, object_store: Arc<dyn ObjectStore>) {
+        let db = Db::builder(path.clone(), object_store)
+            .build()
+            .await
+            .unwrap();
+        test_utils::seed_database(&db, &three_region_table(), false)
+            .await
+            .unwrap();
+        flush_and_close(db).await;
+    }
+
+    /// Flush the WAL and the memtable, then close. A projected clone of the DB
+    /// is then allowed, because no data is left in the WAL.
+    async fn flush_and_close(db: Db) {
+        db.flush().await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+    }
+
+    async fn clone_sources(
+        sources: Vec<CloneSourceSpec>,
+        clone_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Result<(), SlateDBError> {
+        create_native_clone(
+            sources,
+            clone_path.clone(),
+            object_store.clone(),
+            object_store,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Open a DB whose compactor compacts all L0 SSTs and sorted runs into one
+    /// sorted run each time the returned flag is set.
+    async fn open_with_on_demand_compactor(
+        path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> (Db, Arc<AtomicBool>) {
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let flag = should_compact.clone();
+        let supplier = Arc::new(test_utils::OnDemandCompactionSchedulerSupplier::new(
+            Arc::new(move |_| flag.swap(false, Ordering::SeqCst)),
+        ));
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_compactor_builder(
+                CompactorBuilder::new(path.clone(), object_store)
+                    .with_scheduler_supplier(supplier)
+                    .with_options(CompactorOptions {
+                        poll_interval: Duration::from_millis(100),
+                        worker: Some(CompactionWorkerOptions {
+                            compactions_poll_interval: Duration::from_millis(100),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+            )
+            .build()
+            .await
+            .unwrap();
+        (db, should_compact)
+    }
+
+    async fn compact_all(db: &Db, should_compact: &AtomicBool) {
+        should_compact.store(true, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let state = db.inner.state.read();
+                    let state = state.state();
+                    let tree = &state.core().tree;
+                    if tree.l0.is_empty() && !tree.compacted.is_empty() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("compaction did not finish");
+    }
+
+    async fn assert_scan(db: &Db, expected: &[&'static [u8]]) {
+        let mut iter = db.scan(..).await.unwrap();
+        let mut keys = vec![];
+        while let Some(kv) = iter.next().await.unwrap() {
+            keys.push(kv.key);
+        }
+        let expected: Vec<Bytes> = expected.iter().map(|k| Bytes::from_static(k)).collect();
+        assert_eq!(keys, expected);
+    }
+
+    #[tokio::test]
+    async fn should_project_clone_on_multiple_ranges() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_multi_range");
+        let clone_path = Path::from("/tmp/test_clone_multi_range");
+        build_parent(&parent_path, object_store.clone()).await;
+
+        // when: the clone keeps the tenant range [0, 5) in both regions
+        clone_sources(
+            vec![CloneSourceSpec::new(parent_path.clone())
+                .with_projection_ranges(tenant_ranges(b"0", b"5"))],
+            &clone_path,
+            object_store.clone(),
+        )
+        .await
+        .unwrap();
+
+        // then: the parent's L0 SST has one view for each range, with
+        // different view IDs
+        let store = ManifestStore::new(&clone_path, object_store.clone());
+        let stored = store.read_latest_manifest().await.unwrap();
+        let l0 = &stored.manifest.core.tree.l0;
+        assert_eq!(l0.len(), 2);
+        assert_eq!(l0[0].sst.id, l0[1].sst.id);
+        assert_ne!(l0[0].id, l0[1].id);
+
+        // then: keys in both ranges are visible, keys between and outside the
+        // ranges are not
+        let (clone_db, should_compact) =
+            open_with_on_demand_compactor(&clone_path, object_store.clone()).await;
+        assert_eq!(
+            clone_db.get(b"hot/1").await.unwrap(),
+            Some(Bytes::from_static(b"h1"))
+        );
+        assert_eq!(
+            clone_db.get(b"row/1").await.unwrap(),
+            Some(Bytes::from_static(b"r1"))
+        );
+        for hidden in [b"hot/7", b"idx/1", b"row/7"] {
+            assert_eq!(clone_db.get(hidden).await.unwrap(), None);
+        }
+        assert_scan(&clone_db, &[b"hot/1", b"row/1"]).await;
+
+        // when: the clone writes a key between its ranges, and compacts
+        clone_db.put(b"idx/9", b"i9").await.unwrap();
+        clone_db
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        compact_all(&clone_db, &should_compact).await;
+
+        // then: the clone's own write is visible, and the parent's keys
+        // outside the ranges stay hidden
+        assert_scan(&clone_db, &[b"hot/1", b"idx/9", b"row/1"]).await;
+        clone_db.close().await.unwrap();
+
+        // then: the same is true after reopen
+        let clone_db = Db::open(clone_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        assert_scan(&clone_db, &[b"hot/1", b"idx/9", b"row/1"]).await;
+        assert_eq!(clone_db.get(b"idx/1").await.unwrap(), None);
+        clone_db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_union_clones_projected_on_multiple_ranges() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_multi_range_union");
+        let left_path = Path::from("/tmp/test_left_multi_range_union");
+        let right_path = Path::from("/tmp/test_right_multi_range_union");
+        let merged_path = Path::from("/tmp/test_merged_multi_range_union");
+        build_parent(&parent_path, object_store.clone()).await;
+
+        // given: two clones that split the tenant ranges at 5. Neither clone
+        // compacts, so both keep views of the parent's L0 SST.
+        for (path, lo, hi) in [(&left_path, b"0", b"5"), (&right_path, b"5", b"9")] {
+            clone_sources(
+                vec![CloneSourceSpec::new(parent_path.clone())
+                    .with_projection_ranges(tenant_ranges(lo, hi))],
+                path,
+                object_store.clone(),
+            )
+            .await
+            .unwrap();
+        }
+        let left = Db::open(left_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        left.put(b"hot/2", b"h2").await.unwrap();
+        left.put(b"idx/L", b"left-index").await.unwrap();
+        flush_and_close(left).await;
+        let right = Db::open(right_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        right.put(b"row/8", b"r8").await.unwrap();
+        flush_and_close(right).await;
+
+        // when: the union keeps the ranges of each clone
+        clone_sources(
+            vec![
+                CloneSourceSpec::new(left_path.clone())
+                    .with_projection_ranges(tenant_ranges(b"0", b"5")),
+                CloneSourceSpec::new(right_path.clone())
+                    .with_projection_ranges(tenant_ranges(b"5", b"9")),
+            ],
+            &merged_path,
+            object_store.clone(),
+        )
+        .await
+        .unwrap();
+
+        // then: L0 view IDs are unique, although both clones have views of
+        // the parent's SST with the parent's view ID
+        let store = ManifestStore::new(&merged_path, object_store.clone());
+        let stored = store.read_latest_manifest().await.unwrap();
+        let l0 = &stored.manifest.core.tree.l0;
+        let view_ids: std::collections::HashSet<_> = l0.iter().map(|view| view.id).collect();
+        assert_eq!(view_ids.len(), l0.len());
+
+        // then: the union holds the tenant rows of both clones, and drops the
+        // rows outside the ranges, also after compaction and reopen
+        let expected: [&'static [u8]; 6] =
+            [b"hot/1", b"hot/2", b"hot/7", b"row/1", b"row/7", b"row/8"];
+        let (merged, should_compact) =
+            open_with_on_demand_compactor(&merged_path, object_store.clone()).await;
+        assert_scan(&merged, &expected).await;
+        compact_all(&merged, &should_compact).await;
+        assert_scan(&merged, &expected).await;
+        merged.close().await.unwrap();
+        let merged = Db::open(merged_path.clone(), object_store.clone())
+            .await
+            .unwrap();
+        assert_scan(&merged, &expected).await;
+        merged.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_reject_projection_without_ranges() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_no_ranges");
+        let clone_path = Path::from("/tmp/test_clone_no_ranges");
+        build_parent(&parent_path, object_store.clone()).await;
+
+        let err = clone_sources(
+            vec![CloneSourceSpec::new(parent_path.clone()).with_projection_ranges(vec![])],
+            &clone_path,
+            object_store.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, SlateDBError::InvalidProjection { .. }));
     }
 }
