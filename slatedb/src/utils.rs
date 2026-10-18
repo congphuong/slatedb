@@ -120,6 +120,7 @@ where
     //       on the db, this would result in a gap where the db is not in an error state
     //       but resources such as channels have been dropped or closed. See #623 for
     //       details.
+    let future = crate::spawn_hook::scoped(Some(crate::spawn_hook::base_name(&name)), future);
     let wrapped = AssertUnwindSafe(future).catch_unwind().map(move |outcome| {
         let result = match outcome {
             Ok(result) => result,
@@ -180,7 +181,9 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    tokio::spawn(with_optional_subscriber(future))
+    tokio::spawn(with_optional_subscriber(crate::spawn_hook::scoped(
+        None, future,
+    )))
 }
 
 /// Runs the future with the current tracing subscriber if one is set.

@@ -161,11 +161,11 @@ impl WalSstIterator {
             let table = self.table.clone();
             let index = Arc::clone(&index);
             let next_block_idx_to_fetch = blocks.end;
-            let join_handle = tokio::spawn(async move {
+            let join_handle = tokio::spawn(crate::spawn_hook::scoped(None, async move {
                 table_store
                     .read_blocks_using_index(&table, index, blocks)
                     .await
-            });
+            }));
             self.fetch_tasks.push_back(FetchTask::InFlight {
                 join_handle: AbortOnDropHandle::new(join_handle),
                 _fetch_guard: fetch_guard,
