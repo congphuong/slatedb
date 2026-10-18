@@ -1207,9 +1207,12 @@ impl DbReader {
         if !matches!(mode, DbReaderMode::Checkpoint(_)) {
             inner.spawn_manifest_poller(&task_executor)?;
         }
-        let stream_task = inner
-            .streams_wal()
-            .then(|| StreamTask(tokio::spawn(Arc::clone(&inner).stream_wal())));
+        let stream_task = inner.streams_wal().then(|| {
+            StreamTask(tokio::spawn(crate::spawn_hook::scoped(
+                Some("reader_wal_stream"),
+                Arc::clone(&inner).stream_wal(),
+            )))
+        });
 
         Ok(Self {
             inner,

@@ -332,11 +332,14 @@ impl SlateDbWalIterator {
             }
         }
 
-        let handle = task::spawn(open_file_iter(
-            next_wal_id,
-            self.sst_iter_options.clone(),
-            Arc::clone(&self.wal_store),
-            self.end_bound.clone(),
+        let handle = task::spawn(crate::spawn_hook::scoped(
+            None,
+            open_file_iter(
+                next_wal_id,
+                self.sst_iter_options.clone(),
+                Arc::clone(&self.wal_store),
+                self.end_bound.clone(),
+            ),
         ));
         self.next_files.push_back(handle);
         true

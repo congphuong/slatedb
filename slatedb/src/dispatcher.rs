@@ -750,7 +750,7 @@ impl MessageHandlerExecutor {
             futures.push(MessageHandlerFuture {
                 name: name.clone(),
                 group_index,
-                future: Box::pin(future),
+                future: Box::pin(crate::spawn_hook::scoped(Some(&name), future)),
                 token: token.clone(),
                 handle: handle.clone(),
             });

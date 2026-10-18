@@ -136,8 +136,9 @@ impl PendingSstUploads {
                 encoded_bytes,
             })
         };
-        self.tasks
-            .spawn(crate::utils::with_optional_subscriber(close));
+        self.tasks.spawn(crate::utils::with_optional_subscriber(
+            crate::spawn_hook::scoped(None, close),
+        ));
     }
 
     async fn finish(

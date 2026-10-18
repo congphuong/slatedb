@@ -96,6 +96,7 @@ pub mod object_store_tag;
 pub mod prefix_extractor;
 pub mod seq_tracker;
 pub mod size_tiered_compaction;
+pub mod spawn_hook;
 pub mod wal;
 
 mod batch;
