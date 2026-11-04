@@ -965,7 +965,7 @@ impl<P: Into<Path>> DbBuilder<P> {
             &tokio_handle,
             &task_executor,
             inner.status_manager.as_ref(),
-            compaction_signals,
+            compaction_signals.clone(),
         )?;
 
         // Monitor background tasks
@@ -985,6 +985,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         Ok(Db {
             inner,
             task_executor,
+            compaction_signals,
         })
     }
 }

@@ -589,6 +589,9 @@ impl DbInner {
 pub struct Db {
     pub(crate) inner: Arc<DbInner>,
     task_executor: Arc<MessageHandlerExecutor>,
+    /// Signals to the compactor in this process. `None` when this `Db` runs
+    /// no compactor. See [`Db::wake_compactor`].
+    pub(crate) compaction_signals: Option<crate::compaction_signals::CompactionSignals>,
 }
 
 impl Db {
@@ -2017,6 +2020,23 @@ impl DbWriteOps for Db {
 }
 
 impl Db {
+    /// Wakes the compaction coordinator in this process. The coordinator then
+    /// reads the manifest and the compactions file, as on a poll tick. It
+    /// schedules a compaction that [`crate::admin::Admin::submit_compaction`]
+    /// submitted, without a wait for the next
+    /// [`CompactorOptions::poll_interval`](crate::config::CompactorOptions::poll_interval)
+    /// tick.
+    ///
+    /// Call this after you submit a compaction for a database that this `Db`
+    /// opened with a compactor. If this `Db` runs no compactor, the call does
+    /// nothing. Repeated calls before the coordinator runs collapse into one
+    /// wake-up.
+    pub fn wake_compactor(&self) {
+        if let Some(signals) = &self.compaction_signals {
+            signals.l0_flushed.raise();
+        }
+    }
+
     /// See [`DbMetadataOps::manifest`].
     pub fn manifest(&self) -> VersionedManifest {
         <Self as DbMetadataOps>::manifest(self)
