@@ -26,6 +26,12 @@
 //! the signals can set long poll intervals, so that an idle database sends
 //! almost no requests to the object store.
 //!
+//! A caller that submits a compaction through
+//! [`Admin::submit_compaction`](crate::admin::Admin::submit_compaction) can call
+//! [`Db::wake_compactor`](crate::Db::wake_compactor) on the open `Db`. The call
+//! raises [`CompactionSignals::l0_flushed`], so the coordinator reads the new
+//! compaction at once.
+//!
 //! A signal holds at most one pending wake-up. If a component raises a signal
 //! many times before the listener runs, the listener handles one event. A
 //! listener always reads the current state from the object store, so one event
@@ -305,6 +311,64 @@ mod tests {
         let idle = store.requests() - before;
 
         assert_eq!(idle, 0, "an idle database sent {idle} requests");
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn should_run_a_submitted_compaction_after_wake_compactor() {
+        use crate::admin::AdminBuilder;
+        use crate::compactor_state::{CompactionSpec, SourceId};
+
+        let store = CountingObjectStore::new();
+        let db = open_db(store.clone(), settings_without_polls(8)).await;
+        // One L0 SST is below `min_compaction_sources`, so the scheduler does
+        // not compact it. Let the coordinator handle the flush signal first.
+        write_l0(&db, 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let l0: Vec<SourceId> = db
+            .inner
+            .state
+            .read()
+            .state()
+            .core()
+            .tree
+            .l0
+            .iter()
+            .map(|view| SourceId::SstView(view.id))
+            .collect();
+        assert_eq!(l0.len(), 1);
+
+        // A process submits a compaction through `Admin`. No signal reports
+        // it, and the next poll is an hour away.
+        let admin = AdminBuilder::new("/tmp/test_compaction_signals", store.clone()).build();
+        admin
+            .submit_compaction(CompactionSpec::new(l0, 0))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            l0_and_sorted_runs(&db).1,
+            0,
+            "the compaction ran without a wake-up"
+        );
+
+        db.wake_compactor();
+
+        wait_for_sorted_run(&db).await;
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_ignore_wake_compactor_without_a_compactor() {
+        let settings = Settings {
+            compactor_options: None,
+            garbage_collector_options: None,
+            ..Default::default()
+        };
+        let db = open_db(CountingObjectStore::new(), settings).await;
+
+        db.wake_compactor();
+
         db.close().await.unwrap();
     }
 
