@@ -8058,6 +8058,108 @@ mod tests {
         );
     }
 
+    /// The coordinator can stop after the final manifest write of a job, but before
+    /// it writes `Completed` to `.compactions`. On restart it commits the same
+    /// `Compacted` entry again. That retry writes no manifest, so it must not raise
+    /// `manifest_compacted`: the writer has no new manifest to read.
+    #[tokio::test]
+    async fn test_retry_of_an_applied_final_commit_raises_no_manifest_compacted() {
+        let mut fixture = CompactorEventHandlerTestFixture::new().await;
+        let signals = CompactionSignals::default();
+        fixture.handler.signals = Some(signals.clone());
+
+        // given: SR 0 and SR 1, each made from one L0
+        for destination in [0u32, 1] {
+            fixture.write_l0().await;
+            fixture.handler.state_writer.refresh().await.unwrap();
+            let sources: Vec<SourceId> = fixture
+                .handler
+                .state()
+                .db_state()
+                .tree
+                .l0
+                .iter()
+                .map(|view| SourceId::SstView(view.id))
+                .collect();
+            let job = compacted_with_output(
+                Ulid::from_parts(u64::from(destination) + 1, 0),
+                CompactionSpec::new(sources, destination),
+                vec![fake_output_sst()],
+            );
+            fixture.handler.state_mut().insert_compaction_for_test(job);
+            assert!(
+                fixture.handler.commit_compacted_entries().await.unwrap(),
+                "an L0 commit changes the tree"
+            );
+        }
+
+        // given: the final commit of [SR 1, SR 0] -> SR 0 is in the manifest
+        // The ids go up, so this job is the last finished one. `.compactions`
+        // keeps only that finished entry.
+        let job = compacted_with_output(
+            Ulid::from_parts(3, 0),
+            CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(0)], 0),
+            vec![fake_output_sst()],
+        );
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(job.clone());
+        assert!(fixture.handler.commit_compacted_entries().await.unwrap());
+        let mut listener = signals.manifest_compacted.notifier(|| ());
+        // Take the event of the commits above. A signal holds one event at most.
+        tokio::time::timeout(Duration::from_secs(5), listener.notify())
+            .await
+            .expect("the commits above raise manifest_compacted");
+        let manifest_id_before = fixture
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .id();
+
+        // when: the coordinator restarts and finds the same entry still `Compacted`
+        fixture
+            .handler
+            .state_mut()
+            .insert_compaction_for_test(job.clone());
+        let changed = fixture.handler.commit_compacted_entries().await.unwrap();
+
+        // then: no manifest write and no signal
+        assert!(!changed, "the retry must not report a changed tree");
+        let manifest_id_after = fixture
+            .manifest_store
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .id();
+        assert_eq!(manifest_id_after, manifest_id_before);
+        let second = tokio::time::timeout(Duration::from_millis(100), listener.notify()).await;
+        assert!(
+            second.is_err(),
+            "the retry must not raise manifest_compacted"
+        );
+        // The entry leaves `Compacted`. Without a check of the manifest, the retry
+        // fails validation (SR 1 is gone) and marks it `Failed`. With the check, it
+        // marks it `Completed`. Both are safe, because the manifest holds the result.
+        let status = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions
+            .get(&job.id())
+            .expect("missing compaction")
+            .status();
+        assert!(
+            matches!(
+                status,
+                CompactionStatus::Completed | CompactionStatus::Failed
+            ),
+            "unexpected status {status:?}"
+        );
+    }
+
     /// A Running compaction whose heartbeat is older than the timeout must be
     /// reset to Scheduled (worker cleared) by `reclaim_stale_workers`.
     #[tokio::test]
