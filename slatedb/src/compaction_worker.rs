@@ -52,7 +52,7 @@
 //! The coordinator emits complementary metrics (`jobs_claimed`, `jobs_reclaimed`,
 //! `worker_last_heartbeat_ms`) on its own recorder.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -340,6 +340,13 @@ impl CompactionWorkerHandler {
             let mut dirty_compactions = stored.prepare_dirty()?;
 
             let mut to_claim: Vec<Compaction> = Vec::new();
+            // Destinations that a job already owns. The executor runs one task
+            // per destination and panics on a second one, which stops the Db.
+            let mut owned_destinations: HashSet<u32> = dirty_compactions
+                .value
+                .iter_with_status(&[CompactionStatus::Running, CompactionStatus::Compacted])
+                .filter_map(|c| c.spec().destination())
+                .collect();
             for c in dirty_compactions
                 .value
                 .iter_with_status(&[CompactionStatus::Scheduled])
@@ -363,7 +370,18 @@ impl CompactionWorkerHandler {
                         c.id()
                     );
                     Self::stop_compaction_job(&self.executor, &mut self.job_progress, c.id());
+                } else if c
+                    .spec()
+                    .destination()
+                    .is_some_and(|dst| owned_destinations.contains(&dst))
+                {
+                    debug!(
+                        "skipping; another job owns this destination [worker_id={}, id={}]",
+                        self.worker_id,
+                        c.id()
+                    );
                 } else if to_claim.len() < capacity {
+                    owned_destinations.extend(c.spec().destination());
                     to_claim.push(c.clone());
                 }
             }
@@ -957,7 +975,19 @@ mod tests {
         /// Writes a single Scheduled compaction directly to `.compactions`,
         /// simulating one a coordinator would emit.
         async fn seed_scheduled_compaction(&self, id: Ulid, sources: Vec<SourceId>) {
-            let spec = CompactionSpec::new(sources, 0);
+            self.seed_scheduled_compaction_to(id, sources, 0).await;
+        }
+
+        /// Like [`Self::seed_scheduled_compaction`], with destination sorted
+        /// run `destination`. Two jobs that a worker can claim together need two
+        /// destinations: the worker claims one job per destination.
+        async fn seed_scheduled_compaction_to(
+            &self,
+            id: Ulid,
+            sources: Vec<SourceId>,
+            destination: u32,
+        ) {
+            let spec = CompactionSpec::new(sources, destination);
             let compaction = Compaction::new(id, spec).with_status(CompactionStatus::Scheduled);
             let mut stored = StoredCompactions::try_load(self.compactions_store.clone())
                 .await
@@ -1001,6 +1031,33 @@ mod tests {
 
         // And the worker tracks the job locally.
         assert!(fx.handler.job_progress.contains_key(&id));
+    }
+
+    /// A worker must not claim two jobs with one destination. The executor runs
+    /// one task per destination and panics on a second one, which stops the Db.
+    /// Must see: the worker claims the older job and leaves the other
+    /// `Scheduled` without a worker.
+    #[tokio::test]
+    async fn test_worker_claims_one_job_per_destination() {
+        let mut fx = WorkerFixture::new("worker-A").await;
+        let first = Ulid::from_parts(1, 0);
+        let second = Ulid::from_parts(2, 0);
+        for id in [first, second] {
+            fx.seed_scheduled_compaction(id, vec![SourceId::SstView(fx.l0_view.id)])
+                .await;
+        }
+
+        fx.handler.poll_and_claim().await.unwrap();
+
+        let jobs = fx.executor.jobs();
+        assert_eq!(jobs.len(), 1, "one job per destination");
+        assert_eq!(jobs[0].compaction_id, first);
+        let waiting = fx
+            .read_compaction(second)
+            .await
+            .expect("compaction missing");
+        assert_eq!(waiting.status(), CompactionStatus::Scheduled);
+        assert!(waiting.worker().is_none());
     }
 
     #[tokio::test]
@@ -1127,7 +1184,7 @@ mod tests {
         assert_eq!(c.worker().unwrap().last_heartbeat_ms, 12345);
 
         let next_id = Ulid::from_parts(2, 0);
-        fx.seed_scheduled_compaction(next_id, vec![SourceId::SstView(fx.l0_view.id)])
+        fx.seed_scheduled_compaction_to(next_id, vec![SourceId::SstView(fx.l0_view.id)], 1)
             .await;
         fx.handler.poll_and_claim().await.unwrap();
 
@@ -1292,7 +1349,7 @@ mod tests {
         let id2 = Ulid::from_parts(2, 0);
         fx.seed_scheduled_compaction(id1, vec![SourceId::SstView(fx.l0_view.id)])
             .await;
-        fx.seed_scheduled_compaction(id2, vec![SourceId::SstView(fx.l0_view.id)])
+        fx.seed_scheduled_compaction_to(id2, vec![SourceId::SstView(fx.l0_view.id)], 1)
             .await;
         fx.handler.poll_and_claim().await.unwrap();
         assert_eq!(fx.handler.job_progress.len(), 2);
@@ -1534,7 +1591,7 @@ mod tests {
         let kept_id = Ulid::from_parts(2, 0);
         fx.seed_scheduled_compaction(lost_id, vec![SourceId::SstView(fx.l0_view.id)])
             .await;
-        fx.seed_scheduled_compaction(kept_id, vec![SourceId::SstView(fx.l0_view.id)])
+        fx.seed_scheduled_compaction_to(kept_id, vec![SourceId::SstView(fx.l0_view.id)], 1)
             .await;
         fx.handler.poll_and_claim().await.unwrap();
         assert_eq!(fx.handler.job_progress.len(), 2);

@@ -916,7 +916,25 @@ impl CompactorEventHandler {
             return Ok(());
         }
 
+        // A reclaimed job goes back to `Scheduled` only if no other job owns its
+        // destination. A bucket can hold two stale jobs with one destination
+        // (two external submissions of the same spec). A worker that claims
+        // both stops the Db, at each open. The job that waits goes back to
+        // `Submitted`, so the coordinator validates it again before a worker
+        // can claim it. A job with stored progress goes first, then the older job.
+        let mut stale = stale;
+        stale.sort_by_key(|(id, _)| {
+            let ctx = self
+                .state()
+                .compactions_with_status(&[CompactionStatus::Running])
+                .find(|c| c.id() == *id)
+                .and_then(|c| c.ctx())
+                .is_some();
+            (!ctx, *id)
+        });
+        let mut pending: HashSet<Ulid> = stale.iter().map(|(id, _)| *id).collect();
         for (id, worker_id) in &stale {
+            pending.remove(id);
             match worker_id {
                 Some(worker_id) => info!(
                     "reclaiming stale compaction whose worker's heartbeat timed out \
@@ -933,8 +951,27 @@ impl CompactorEventHandler {
                     error!("{message}");
                 }
             }
+            let destination = self
+                .state()
+                .compactions_with_status(&[CompactionStatus::Running])
+                .find(|c| c.id() == *id)
+                .and_then(|c| c.spec().destination());
+            let claimed = destination.is_some_and(|dst| {
+                self.state()
+                    .destination_claimed(dst, |other| other == *id || pending.contains(&other))
+            });
+            let status = if claimed {
+                info!(
+                    "reclaimed compaction waits because another job owns its destination \
+                     [id={}, destination={:?}]",
+                    id, destination
+                );
+                CompactionStatus::Submitted
+            } else {
+                CompactionStatus::Scheduled
+            };
             self.state_mut().update_compaction(id, |c| {
-                c.set_status(CompactionStatus::Scheduled);
+                c.set_status(status);
                 c.set_worker(None);
             });
         }
@@ -1535,11 +1572,14 @@ impl CompactorEventHandler {
     /// guarantees the coordinator has the entry in local state before any
     /// remote worker can transition it onward.
     async fn maybe_validate_submitted_compactions(&mut self) -> Result<(), SlateDBError> {
-        let submitted_compactions = self
+        let mut submitted_compactions = self
             .state()
             .compactions_with_status(&[CompactionStatus::Submitted])
             .cloned()
             .collect::<Vec<_>>();
+        // Two submissions can name one destination (see the destination check
+        // below). A job with stored progress goes first, then the older job.
+        submitted_compactions.sort_by_key(|c| (c.ctx().is_none(), c.id()));
 
         if submitted_compactions.is_empty() {
             return Ok(());
@@ -1559,6 +1599,25 @@ impl CompactorEventHandler {
                     c.set_status(CompactionStatus::Failed)
                 });
                 continue;
+            }
+
+            // An external submission (`Admin::submit_compaction`) enters
+            // `.compactions` without the destination check of `add_compaction`.
+            // Do not promote it while another job owns its destination: the
+            // executor runs one task per destination and panics on a second one.
+            // The spec stays `Submitted`. When the destination is free, it is
+            // validated again against the manifest of that time.
+            if let Some(dst) = compaction.spec().destination() {
+                if self
+                    .state()
+                    .destination_claimed(dst, |id| id == compaction.id())
+                {
+                    debug!(
+                        "deferring compaction whose destination another job owns [compaction={:?}]",
+                        compaction
+                    );
+                    continue;
+                }
             }
 
             // Coordinator-local compactions never enter Scheduled because no
@@ -5836,6 +5895,84 @@ mod tests {
         );
     }
 
+    /// An external submission (the `Admin::submit_compaction` path) enters
+    /// `.compactions` without the destination check of `add_compaction`. Two
+    /// submissions of the same full compaction give two specs with one
+    /// destination. Before the fix, promotion scheduled both, and the worker
+    /// panicked on the second job (`compactor_executor.rs`: one task per
+    /// destination). The Db then failed at each open. Must see: the second spec
+    /// waits in `Submitted` until the destination is free, and is not lost.
+    #[tokio::test]
+    async fn test_maybe_validate_defers_submission_whose_destination_is_claimed() {
+        let options = Arc::new(CompactorOptions {
+            max_concurrent_compactions: 4,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            Arc::new(DefaultSystemClock::new()) as Arc<dyn SystemClock>,
+            options,
+        )
+        .await;
+        let rand = Arc::new(DbRand::default());
+        let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let spec = || CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(2)], 2);
+        let first = Compactor::submit(
+            spec(),
+            fixture.compactions_store.clone(),
+            rand.clone(),
+            clock.clone(),
+        )
+        .await
+        .expect("failed to submit compaction");
+        let second = Compactor::submit(spec(), fixture.compactions_store.clone(), rand, clock)
+            .await
+            .expect("failed to submit compaction");
+        fixture.handler.state_writer.refresh().await.unwrap();
+        let core = &mut fixture
+            .handler
+            .state_writer
+            .state
+            .manifest_mut_for_test()
+            .value
+            .core;
+        Arc::make_mut(&mut core.tree).compacted = vec![
+            SortedRun::new(1, [bounded_sst_view(1, b"a", b"b")]),
+            SortedRun::new(2, [bounded_sst_view(2, b"y", b"z")]),
+        ];
+
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+
+        // The older spec is claimable. The newer one waits for the destination.
+        assert_eq!(
+            ids_with_status(&fixture, CompactionStatus::Scheduled),
+            vec![first]
+        );
+        assert_eq!(
+            ids_with_status(&fixture, CompactionStatus::Submitted),
+            vec![second]
+        );
+        assert!(ids_with_status(&fixture, CompactionStatus::Failed).is_empty());
+
+        // The first job finishes; the destination is free again.
+        fixture
+            .handler
+            .state_mut()
+            .update_compaction(&first, |c| c.set_status(CompactionStatus::Completed));
+        fixture
+            .handler
+            .maybe_validate_submitted_compactions()
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_with_status(&fixture, CompactionStatus::Scheduled),
+            vec![second]
+        );
+    }
+
     /// A scheduling tick must not panic when more compactions are `Running` than
     /// the limit allows. An operator reaches this state by lowering
     /// `max_concurrent_compactions` and restarting while jobs run, because
@@ -8275,6 +8412,66 @@ mod tests {
         fixture.handler.update_distributed_compaction_metrics();
         // then: a still-claimed job is not recounted.
         assert_eq!(claimed_count(), 2);
+    }
+
+    /// Two stale `Running` jobs with one destination (the state that the bug of
+    /// `test_maybe_validate_defers_submission_whose_destination_is_claimed`
+    /// leaves in a bucket) must not both become `Scheduled` again. Before the
+    /// fix, the reclaim scheduled both, the worker panicked on the second job,
+    /// and the Db failed at each open. Must see: one job is `Scheduled`, the
+    /// other goes back to `Submitted` and waits for the destination.
+    #[tokio::test]
+    async fn test_reclaim_schedules_one_job_per_destination() {
+        let system_clock = Arc::new(MockSystemClock::new());
+        let timeout = Duration::from_secs(30);
+        let options = Arc::new(CompactorOptions {
+            worker_heartbeat_timeout: timeout,
+            max_concurrent_compactions: 4,
+            ..compactor_options()
+        });
+        let mut fixture = CompactorEventHandlerTestFixture::new_with_clock(
+            system_clock.clone() as Arc<dyn SystemClock>,
+            options,
+        )
+        .await;
+        fixture.handler.state_writer.refresh().await.unwrap();
+
+        let first = Ulid::from_parts(1, 0);
+        let second = Ulid::from_parts(2, 0);
+        for id in [first, second] {
+            fixture.handler.state_mut().insert_compaction_for_test(
+                Compaction::new(
+                    id,
+                    CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(2)], 2),
+                )
+                .with_status(CompactionStatus::Running)
+                .with_worker(Some(WorkerSpec::new("worker-1".to_string(), 0))),
+            );
+        }
+        fixture
+            .handler
+            .state_writer
+            .write_compactions_safely()
+            .await
+            .expect("failed to persist seeded compactions");
+        system_clock.advance(Duration::from_secs(60)).await;
+
+        fixture
+            .handler
+            .reclaim_stale_workers()
+            .await
+            .expect("reclaim_stale_workers failed");
+
+        let stored = fixture
+            .compactions_store
+            .read_latest_compactions()
+            .await
+            .unwrap()
+            .compactions;
+        let status = |id| stored.get(&id).expect("compaction missing").status();
+        assert_eq!(status(first), CompactionStatus::Scheduled);
+        assert_eq!(status(second), CompactionStatus::Submitted);
+        assert!(stored.get(&second).unwrap().worker().is_none());
     }
 
     /// A Running compaction whose heartbeat is within the timeout must NOT be

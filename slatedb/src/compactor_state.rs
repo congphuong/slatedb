@@ -1148,6 +1148,20 @@ impl CompactorState {
         Ok(())
     }
 
+    /// Whether a job that a worker owns or can claim writes sorted run `dst`.
+    /// These are the `Scheduled`, `Running` and `Compacted` entries. `ignore`
+    /// leaves out entries by id (the entry under check, for example).
+    ///
+    /// The executor runs one task per destination, so at most one such job may
+    /// exist per destination.
+    pub(crate) fn destination_claimed(&self, dst: u32, ignore: impl Fn(Ulid) -> bool) -> bool {
+        self.compactions
+            .value
+            .iter_active()
+            .filter(|c| c.status() != CompactionStatus::Submitted && !ignore(c.id()))
+            .any(|c| c.spec().destination() == Some(dst))
+    }
+
     /// Mutates a compaction in place if it exists.
     ///
     /// Terminal entries remain in process-local state until the next successful
