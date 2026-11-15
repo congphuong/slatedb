@@ -5916,7 +5916,7 @@ mod tests {
         let rand = Arc::new(DbRand::default());
         let clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
         let spec = || CompactionSpec::new(vec![SourceId::SortedRun(1), SourceId::SortedRun(2)], 2);
-        let first = Compactor::submit(
+        let a = Compactor::submit(
             spec(),
             fixture.compactions_store.clone(),
             rand.clone(),
@@ -5924,9 +5924,11 @@ mod tests {
         )
         .await
         .expect("failed to submit compaction");
-        let second = Compactor::submit(spec(), fixture.compactions_store.clone(), rand, clock)
+        let b = Compactor::submit(spec(), fixture.compactions_store.clone(), rand, clock)
             .await
             .expect("failed to submit compaction");
+        // Two ids made in one millisecond have a random order, so name them by order.
+        let (first, second) = (a.min(b), a.max(b));
         fixture.handler.state_writer.refresh().await.unwrap();
         let core = &mut fixture
             .handler
@@ -5946,7 +5948,7 @@ mod tests {
             .await
             .unwrap();
 
-        // The older spec is claimable. The newer one waits for the destination.
+        // The spec with the lower id is claimable. The other waits for the destination.
         assert_eq!(
             ids_with_status(&fixture, CompactionStatus::Scheduled),
             vec![first]
