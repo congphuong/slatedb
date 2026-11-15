@@ -15,7 +15,7 @@ use std::time::Duration;
 use log::{debug, info};
 
 use crate::compactions_store::{CompactionsStore, FenceableCompactions, StoredCompactions};
-use crate::compactor_state::{CompactionStatus, CompactorState, VersionedCompactions};
+use crate::compactor_state::{CompactionStatus, Compactions, CompactorState, VersionedCompactions};
 use crate::config::{CheckpointOptions, CompactorOptions};
 use crate::error::SlateDBError;
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
@@ -292,7 +292,8 @@ impl CompactorStateWriter {
     /// local dirty object with the latest version.
     ///
     /// Process-local state retains every terminal transition until this write succeeds.
-    /// Only the outgoing value is trimmed to the latest terminal entry. This preserves
+    /// Only the outgoing value is trimmed, to the latest terminal entry and the entries that
+    /// finished after the last stored version (see [`Self::outgoing_compactions`]). This preserves
     /// terminal entries as tombstones across conflict retries while keeping the persisted
     /// `.compactions` object bounded.
     ///
@@ -300,8 +301,7 @@ impl CompactorStateWriter {
     /// - `Ok(())` when compactions are successfully written.
     /// - `SlateDBError` if an unrecoverable error occurs.
     pub(crate) async fn write_compactions_safely(&mut self) -> Result<(), SlateDBError> {
-        let mut desired_value = self.state.compactions().value.clone();
-        desired_value.retain_active_and_last_finished();
+        let mut desired_value = self.outgoing_compactions()?;
         loop {
             let mut dirty_compactions = self.compactions.prepare_dirty()?;
             dirty_compactions.value = desired_value.clone();
@@ -318,12 +318,29 @@ impl CompactorStateWriter {
                     // progress. Local terminal entries also prevent stale remote active states
                     // for the same ids from being resurrected.
                     self.load_compactions().await?;
-                    desired_value = self.state.compactions().value.clone();
-                    desired_value.retain_active_and_last_finished();
+                    desired_value = self.outgoing_compactions()?;
                 }
                 Err(err) => return Err(err),
             }
         }
+    }
+
+    /// The trimmed value of the next `.compactions` write.
+    ///
+    /// A job that finished after the last stored version goes out once with its final status.
+    /// The trim drops it from the next write. Without this rule, a job with an id below the
+    /// newest finished job leaves the ledger in the same write that finishes it. Then no stored
+    /// version records how the job ended, and a client that submitted it cannot know.
+    fn outgoing_compactions(&self) -> Result<Compactions, SlateDBError> {
+        let stored = self.compactions.prepare_dirty()?;
+        let mut desired = self.state.compactions().value.clone();
+        desired.retain_active_last_finished_and(|c| {
+            !stored
+                .value
+                .get(&c.id())
+                .is_some_and(|s| s.status().finished())
+        });
+        Ok(desired)
     }
 
     /// Writes manifest first, then compactions, retrying manifest conflicts.
@@ -966,10 +983,13 @@ mod tests {
         writer.write_compactions_safely().await.unwrap();
 
         let persisted = compactions_store.read_latest_compactions().await.unwrap();
+        // The completed job is not stored as finished yet, so it goes out once with its final
+        // status. It must not go out with the stale Submitted status of the remote version.
         assert!(
             persisted
                 .recent_compactions()
-                .all(|compaction| compaction.id() != completed_id),
+                .filter(|compaction| compaction.id() == completed_id)
+                .all(|compaction| compaction.status() == CompactionStatus::Completed),
             "stale Submitted compaction was resurrected"
         );
         assert_eq!(
@@ -981,6 +1001,85 @@ mod tests {
             CompactionStatus::Failed
         );
         assert_eq!(writer.state.active_compactions().count(), 0);
+    }
+
+    /// A job finishes after a job with a higher id finished. The write that records the finish
+    /// must keep the job once with its final status. The next write trims it.
+    #[tokio::test]
+    async fn test_write_compactions_safely_records_each_finish_once() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            Arc::clone(&object_store),
+        ));
+        let compactions_store = Arc::new(CompactionsStore::new(
+            &Path::from(ROOT),
+            Arc::clone(&object_store),
+        ));
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        StoredManifest::create_new_db(
+            manifest_store.clone(),
+            ManifestCore::new(),
+            system_clock.clone(),
+        )
+        .await
+        .unwrap();
+        let mut writer = CompactorStateWriter::new(
+            manifest_store,
+            compactions_store.clone(),
+            system_clock,
+            &CompactorOptions::default(),
+            Arc::new(DbRand::new(7)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let older = Ulid::from_parts(10, 0);
+        let newer = Ulid::from_parts(20, 0);
+        let spec = CompactionSpec::new(vec![], 0);
+        for id in [older, newer] {
+            writer
+                .state
+                .insert_compaction_for_test(Compaction::new(id, spec.clone()));
+        }
+        writer
+            .state
+            .update_compaction(&newer, |c| c.set_status(CompactionStatus::Completed));
+        writer.write_compactions_safely().await.unwrap();
+
+        writer
+            .state
+            .update_compaction(&older, |c| c.set_status(CompactionStatus::Failed));
+        writer.write_compactions_safely().await.unwrap();
+        let status_of = |persisted: &VersionedCompactions, id: Ulid| {
+            persisted
+                .recent_compactions()
+                .find(|c| c.id() == id)
+                .map(|c| c.status())
+        };
+        let persisted = compactions_store.read_latest_compactions().await.unwrap();
+        assert_eq!(
+            status_of(&persisted, older),
+            Some(CompactionStatus::Failed),
+            "no stored version records how the older job ended"
+        );
+        assert_eq!(
+            status_of(&persisted, newer),
+            Some(CompactionStatus::Completed)
+        );
+
+        writer.write_compactions_safely().await.unwrap();
+        let persisted = compactions_store.read_latest_compactions().await.unwrap();
+        assert_eq!(
+            status_of(&persisted, older),
+            None,
+            "the ledger keeps old finished jobs"
+        );
+        assert_eq!(
+            status_of(&persisted, newer),
+            Some(CompactionStatus::Completed)
+        );
     }
 
     #[tokio::test]

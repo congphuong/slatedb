@@ -290,7 +290,7 @@ impl CompactionStatus {
         )
     }
 
-    fn finished(self) -> bool {
+    pub(crate) fn finished(self) -> bool {
         matches!(self, CompactionStatus::Completed | CompactionStatus::Failed)
     }
 
@@ -870,6 +870,12 @@ impl Compactions {
 
     /// Keeps the most recently finished compaction and any active compactions, and removes others.
     pub(crate) fn retain_active_and_last_finished(&mut self) {
+        self.retain_active_last_finished_and(|_| false);
+    }
+
+    /// Keeps the active compactions, the most recently finished compaction, and each
+    /// finished compaction that `keep` selects. Removes the others.
+    pub(crate) fn retain_active_last_finished_and(&mut self, keep: impl Fn(&Compaction) -> bool) {
         let latest_finished = self
             .core
             .recent_compactions
@@ -883,9 +889,11 @@ impl Compactions {
             })
             .max();
 
-        self.core
-            .recent_compactions
-            .retain(|id, compaction| compaction.active() || Some(id) == latest_finished.as_ref());
+        self.core.recent_compactions.retain(|id, compaction| {
+            compaction.active()
+                || Some(id) == latest_finished.as_ref()
+                || (compaction.status().finished() && keep(compaction))
+        });
     }
 }
 
